@@ -1,0 +1,20 @@
+{
+  "zone": "lin.mobi",
+  "dns_records": [
+    {"type": "A", "name": "ai.lin.mobi", "content": "18.175.224.165", "proxied": true, "ttl": 1},
+    {"type": "A", "name": "api.ai.lin.mobi", "content": "18.175.224.165", "proxied": false, "ttl": 1},
+    {"type": "A", "name": "*.ai.lin.mobi", "content": "18.175.224.165", "proxied": false, "ttl": 1}
+  ],
+  "ssl_mode": "strict",
+  "automatic_ssl_mode": false,
+  "always_use_https": true,
+  "cache_rules": [
+    {
+      "description": "Sub2API panel dynamic bypass",
+      "enabled": true,
+      "expression": "(http.host eq \"ai.lin.mobi\" and not starts_with(http.request.uri.path, \"/assets/\"))",
+      "action": "set_cache_settings",
+      "action_parameters": {"cache": false}
+    }
+  ]
+}

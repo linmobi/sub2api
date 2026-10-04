@@ -1,3 +1,4 @@
+import argparse
 import http.client
 import json
 import os
@@ -12,7 +13,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--panel-cdn', action='store_true',
+                    help='Expect Cloudflare Always Use HTTPS redirects on the panel host')
+args = parser.parse_args()
 opener = urllib.request.build_opener(NoRedirect)
+opener.addheaders = [('User-Agent', 'Sub2API-Deployment-Check/1.0')]
 results = []
 
 
@@ -73,9 +79,11 @@ for path in ['/', '/login', '/admin', '/assets/index.js', '/index.html',
 check(api, '/api/v1/auth/login', 404, method='POST')
 check(panel, '/v1%2fmodels', 404)
 check(panel, '//v1//models', 404)
-check(panel, '/login', 308, scheme='http', location='https://ai.lin.mobi/login')
+check(panel, '/login', 301 if args.panel_cdn else 308, scheme='http', location='https://ai.lin.mobi/login')
 check(api, '/v1/models', 308, scheme='http', location='https://api.ai.lin.mobi/v1/models')
-check(panel, '/v1/models', 404, scheme='http')
+# Cloudflare redirects HTTP before origin routing; HTTPS remains blocked above.
+check(panel, '/v1/models', 301 if args.panel_cdn else 404, scheme='http',
+      location='https://ai.lin.mobi/v1/models' if args.panel_cdn else None)
 check(api, '/login', 404, scheme='http')
 
 for scheme in ['http', 'https']:
