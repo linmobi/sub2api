@@ -1,0 +1,8 @@
+# Instance credentials, private keys and generated records stay on the server.
+.env*
+*.ini
+*.pem
+*.key
+*credentials*
+*-verification.json
+backups/
