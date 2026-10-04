@@ -106,3 +106,13 @@ docker compose -p sub2api-production up -d --no-deps --no-build --pull never sub
 重建应用会短暂中断访问，因此应避开活跃生成请求。仅执行 `restart` 不会更新容器环境变量。回退时恢复原环境文件，或设 `GATEWAY_OPENAI_HTTP2_ENABLED=true`，再重新创建应用服务。
 
 应用加载新配置后健康检查返回 200，一次低推理强度的 Astra 短请求约 4.73 秒完成，收到 `response.completed`。此验证确认流式调用可以完整结束，尚未验证与原请求相同的长任务。配置备份和验证记录保存在虚拟机 `/opt/sub2api/public-deployment/`，不提交生产凭据或真实聊天内容。
+
+### 长请求复查
+
+同日后续复查发现，启用 HTTP/1.1 后仍有五条 Astra 长请求约在 901.2 秒中断，读取错误变为 `unexpected EOF`，客户端显示 `Upstream response stream was interrupted`。因此上述协议调整尚未解决长请求中断，不能仅凭短测试认定问题已经修复。
+
+已核对本实例没有配置普通 OpenAI HTTP 请求的 900 秒总超时，账户没有出站代理，容器没有代理环境变量；公网 Nginx 的读取和发送超时均为 3600 秒，API 域名仍仅 DNS。901 秒的重复时长提示某层存在稳定的连接生命周期，但尚未确认具体原因，不能据此断言 OpenAI 官方设有固定 15 分钟上限。
+
+使用独立的简单算术题、空工具列表及 `reasoning.mode=standard` 对照：`medium` 约 2.54 秒、`max` 约 5.15 秒，均收到 `response.completed`，答案正确。这确认两个档位的短请求可用，不能代表复杂长任务也能完成。现有推理设置和分组限制没有修改。
+
+普通助手可先使用 `medium`、新会话和较小的单次任务缓解，再逐步恢复高推理强度。不要在流已经开始输出后自动重放同一请求，也不要仅调整响应头或空闲连接超时来处理此问题。此 OAuth 路径会移除客户端的 `max_output_tokens`，因此输出 Token 上限不能作为可靠的请求限时办法。诊断记录保存在虚拟机 `/opt/sub2api/public-deployment/openai-long-stream-diagnosis.json`，不提交凭据或真实聊天。
