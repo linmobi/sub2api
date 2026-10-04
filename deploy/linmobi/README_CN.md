@@ -116,3 +116,13 @@ docker compose -p sub2api-production up -d --no-deps --no-build --pull never sub
 使用独立的简单算术题、空工具列表及 `reasoning.mode=standard` 对照：`medium` 约 2.54 秒、`max` 约 5.15 秒，均收到 `response.completed`，答案正确。这确认两个档位的短请求可用，不能代表复杂长任务也能完成。现有推理设置和分组限制没有修改。
 
 普通助手可先使用 `medium`、新会话和较小的单次任务缓解，再逐步恢复高推理强度。不要在流已经开始输出后自动重放同一请求，也不要仅调整响应头或空闲连接超时来处理此问题。此 OAuth 路径会移除客户端的 `max_output_tokens`，因此输出 Token 上限不能作为可靠的请求限时办法。诊断记录保存在虚拟机 `/opt/sub2api/public-deployment/openai-long-stream-diagnosis.json`，不提交凭据或真实聊天。
+
+### Nginx、WireGuard 与断开顺序验证
+
+2026-10-04，通过独立测试进程复用现有 WireGuard 链路，按正式 Nginx 的 HTTP/1.1 上游、关闭缓冲及 3600 秒超时配置，分别测试持续心跳和完全静默两条 SSE 流。两条连接均持续 1020 秒（17 分钟），收到完整终止事件；不存在这条转发路径统一在 900 秒断开的现象。测试进程和临时监听端口均已关闭，正式 Nginx、隧道及应用配置未因该测试改变。
+
+同时捕获一次实际 Astra `/v1/responses` 故障的 TCP 元数据：请求持续 901.223 秒，ChatGPT 对端先发送 FIN，虚拟机随后结束连接并记录 `unexpected EOF`。断开前约 8.45 秒仍收到上游数据，因此不符合长时间空闲才触发的超时。上游报文与应用错误使用同一虚拟机时钟；AWS 事件来自另一台主机，跨主机毫秒差只作辅助参考。TCP 元数据不包含请求、凭据或聊天正文。
+
+这些证据将此次故障定位到上游连接结束，不能进一步证明 OpenAI 边缘代理、推理任务或其他上游组件的具体内部原因。重复时长使上游请求生命周期限制成为待验证假设，但没有找到官方公布的 ChatGPT 订阅 HTTP 请求统一 15 分钟限制。[OpenAI 官方仓库的相关 HTTP/SSE 报告](https://github.com/openai/codex/issues/32987)描述的是首事件长期沉默和客户端超时，与本实例的持续数据后对端关闭不同，也没有维护者确认原因或关联修复，不能视为同一故障的证明。
+
+WebSocket 是下一步对照方向。[OpenAI API WebSocket 文档](https://developers.openai.com/api/docs/guides/websocket-mode)描述最长 60 分钟连接；这是 API 文档，不代表 ChatGPT OAuth 通道具有相同保证。原生 WebSocket 的一次独立 Astra 简单算术请求约 3.07 秒完成，只确认基本兼容性。HTTP/SSE 转接的实验设置、上下文限制和验证方法见 [ASTRA_WS_PROTOTYPE.md](ASTRA_WS_PROTOTYPE.md)。尚未通过超过原故障时长的实际长请求前，不应宣称已修复。

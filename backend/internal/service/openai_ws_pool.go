@@ -81,6 +81,9 @@ type openAIWSAcquireRequest struct {
 	ForceNewConn bool
 	// ForcePreferredConn: 强制本次只使用 PreferredConnID，禁止漂移到其它连接。
 	ForcePreferredConn bool
+	// SkipPrewarm keeps request-private bridge headers out of cached dial
+	// templates and suppresses idle-connection creation for this acquire.
+	SkipPrewarm bool
 }
 
 type openAIWSHandshakeCompatibilityKey struct {
@@ -1203,8 +1206,7 @@ retryAcquire:
 					reused:    true,
 				}
 				p.metrics.acquireReuseTotal.Add(1)
-				p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-				p.ensureTargetIdleAsync(accountID)
+				p.recordSuccessfulAcquireAndPrewarm(accountID, acquireGeneration, req)
 				return lease, nil
 			}
 
@@ -1260,8 +1262,7 @@ retryAcquire:
 				reused:    true,
 			}
 			p.metrics.acquireReuseTotal.Add(1)
-			p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-			p.ensureTargetIdleAsync(accountID)
+			p.recordSuccessfulAcquireAndPrewarm(accountID, acquireGeneration, req)
 			return lease, nil
 		}
 
@@ -1283,8 +1284,7 @@ retryAcquire:
 				}
 				lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: conn, connPick: connPick, reused: true}
 				p.metrics.acquireReuseTotal.Add(1)
-				p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-				p.ensureTargetIdleAsync(accountID)
+				p.recordSuccessfulAcquireAndPrewarm(accountID, acquireGeneration, req)
 				return lease, nil
 			} else if conn, ok := ap.conns[preferredConnID]; ok {
 				p.dropDeadConnLocked(ap, conn, &evicted)
@@ -1312,8 +1312,7 @@ retryAcquire:
 			}
 			lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: best, connPick: connPick, reused: true}
 			p.metrics.acquireReuseTotal.Add(1)
-			p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-			p.ensureTargetIdleAsync(accountID)
+			p.recordSuccessfulAcquireAndPrewarm(accountID, acquireGeneration, req)
 			return lease, nil
 		} else if best != nil {
 			p.dropDeadConnLocked(ap, best, &evicted)
@@ -1340,8 +1339,7 @@ retryAcquire:
 					}
 					lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: conn, connPick: connPick, reused: true}
 					p.metrics.acquireReuseTotal.Add(1)
-					p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-					p.ensureTargetIdleAsync(accountID)
+					p.recordSuccessfulAcquireAndPrewarm(accountID, acquireGeneration, req)
 					return lease, nil
 				}
 				p.dropDeadConnLocked(ap, conn, &evicted)
@@ -1443,8 +1441,7 @@ retryAcquire:
 		ap.mu.Unlock()
 		p.metrics.acquireCreateTotal.Add(1)
 		lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: conn, connPick: connPick}
-		p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-		p.ensureTargetIdleAsync(accountID)
+		p.recordSuccessfulAcquireAndPrewarm(accountID, acquireGeneration, req)
 		return lease, nil
 	}
 
@@ -1515,8 +1512,7 @@ acquireAtCapacity:
 
 	lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: target, connPick: connPick, reused: true}
 	p.metrics.acquireReuseTotal.Add(1)
-	p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-	p.ensureTargetIdleAsync(accountID)
+	p.recordSuccessfulAcquireAndPrewarm(accountID, acquireGeneration, req)
 	return lease, nil
 }
 
@@ -1531,7 +1527,18 @@ func (p *openAIWSConnPool) recordConnPickDuration(duration time.Duration) {
 	p.metrics.connPickMs.Add(duration.Milliseconds())
 }
 
+func (p *openAIWSConnPool) recordSuccessfulAcquireAndPrewarm(accountID int64, generation uint64, req openAIWSAcquireRequest) {
+	if req.SkipPrewarm {
+		return
+	}
+	p.recordLastSuccessfulAcquire(accountID, generation, req)
+	p.ensureTargetIdleAsync(accountID)
+}
+
 func (p *openAIWSConnPool) recordLastSuccessfulAcquire(accountID int64, generation uint64, req openAIWSAcquireRequest) {
+	if req.SkipPrewarm {
+		return
+	}
 	if p == nil || accountID <= 0 {
 		return
 	}

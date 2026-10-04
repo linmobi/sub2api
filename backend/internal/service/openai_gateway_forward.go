@@ -19,6 +19,9 @@ import (
 
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	if c != nil {
+		c.Set(openAIAstraHTTPBridgeContextKey, nil)
+	}
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
 	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
@@ -109,8 +112,18 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 	}
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
-	// 仅允许 WS 入站请求走 WS 上游，避免出现 HTTP -> WS 协议混用。
-	wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c))
+	if s.shouldBridgeAstraHTTP(c, account, body, wsDecision) {
+		bridgeScope, bridgeErr := prepareOpenAIAstraHTTPBridge(c, account, body, wsExecutionScope)
+		if bridgeErr != nil {
+			return nil, bridgeErr
+		}
+		wsExecutionScope = bridgeScope
+		wsDecision.Reason = "experimental_astra_http_bridge"
+	} else {
+		// HTTP keeps its established upstream protocol unless every experimental
+		// gate above is explicitly enabled for this account and model.
+		wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c))
+	}
 	passthroughEnabled := account.IsOpenAIPassthroughEnabled()
 	compactPath := isOpenAIResponsesCompactPath(c)
 	if shouldFlattenOpenAIResponsesNamespaces(account, wsDecision.Transport, passthroughEnabled, compactPath) {
@@ -909,6 +922,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if wsErr == nil {
 				break
 			}
+			if _, bridge := openAIAstraHTTPBridgeFromContext(c); bridge && wsResult != nil &&
+				(wsResult.ResponseID != "" || wsResult.Usage.InputTokens > 0 || wsResult.Usage.OutputTokens > 0) {
+				// Acknowledged generations may already have usage even before a
+				// token/comment is delivered. Never invisibly replay and lose it.
+				break
+			}
 			if c != nil && c.Writer != nil && c.Writer.Written() {
 				break
 			}
@@ -1018,6 +1037,18 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return wsResult, nil
 		}
 		s.writeOpenAIWSFallbackErrorResponse(c, account, wsErr)
+		if _, bridge := openAIAstraHTTPBridgeFromContext(c); bridge && wsResult != nil {
+			wsResult.UpstreamModel = upstreamModel
+			if wsResult.BillingModel == "" {
+				wsResult.BillingModel = billingModel
+			}
+			if wsResult.ImageCount > 0 {
+				wsResult.ImageSize = imageSizeTier
+				wsResult.ImageInputSize = imageInputSize
+				wsResult.BillingModel = imageBillingModel
+			}
+			return wsResult, wsErr
+		}
 		return nil, wsErr
 	}
 

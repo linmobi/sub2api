@@ -898,7 +898,19 @@ func (s *OpenAIGatewayService) writeOpenAIWSFallbackErrorResponse(c *gin.Context
 	if c == nil || c.Writer == nil || c.Writer.Written() {
 		return false
 	}
+	if _, bridge := openAIAstraHTTPBridgeFromContext(c); bridge && c.Request != nil && errors.Is(c.Request.Context().Err(), context.Canceled) {
+		return false
+	}
 	statusCode, errType, clientMessage, upstreamMessage, ok := resolveOpenAIWSFallbackErrorResponse(wsErr)
+	if _, bridge := openAIAstraHTTPBridgeFromContext(c); bridge && !ok {
+		// The HTTP bridge may have staged SSE headers without committing them.
+		// Unknown read/EOF classifications still need one pure JSON failure.
+		statusCode = http.StatusBadGateway
+		errType = "upstream_error"
+		clientMessage = "Upstream response stream was interrupted"
+		upstreamMessage = clientMessage
+		ok = true
+	}
 	if !ok {
 		return false
 	}
@@ -923,12 +935,18 @@ func (s *OpenAIGatewayService) writeOpenAIWSFallbackErrorResponse(c *gin.Context
 			Message:            upstreamMessage,
 		})
 	}
+	if _, bridge := openAIAstraHTTPBridgeFromContext(c); bridge {
+		c.Header("Content-Type", "application/json; charset=utf-8")
+	}
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
 			"type":    errType,
 			"message": clientMessage,
 		},
 	})
+	if _, bridge := openAIAstraHTTPBridgeFromContext(c); bridge {
+		MarkResponseCommitted(c)
+	}
 	return true
 }
 

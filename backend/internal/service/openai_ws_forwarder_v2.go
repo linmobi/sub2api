@@ -34,11 +34,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	attempt int,
 	lastFailureReason string,
 	agentTaskRecoveryTried *bool,
-) (*OpenAIForwardResult, error) {
+) (forwardResult *OpenAIForwardResult, forwardErr error) {
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
 	responseModelObserver := &upstreamResponseModelObserver{}
+	bridgeRequest, astraHTTPBridge := openAIAstraHTTPBridgeFromContext(c)
 
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
 	if err != nil {
@@ -63,12 +64,21 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	)
 
 	payload := s.buildOpenAIWSCreatePayload(reqBody, account)
+	if astraHTTPBridge {
+		payload["store"] = false
+		delete(payload, "previous_response_id")
+		payload["prompt_cache_key"] = bridgeRequest.executionScope
+	}
 	payloadStrategy, removedKeys := applyOpenAIWSRetryPayloadStrategy(payload, attempt)
 	turnState := ""
 	turnMetadata := ""
 	if c != nil && c.Request != nil {
 		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
+	}
+	if astraHTTPBridge {
+		turnState = ""
+		turnMetadata = ""
 	}
 	setOpenAIWSTurnMetadata(payload, turnMetadata)
 	applyStagedCodexFingerprintClientMetadata(c, account, payload)
@@ -79,6 +89,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		// Fingerprint convergence may inject a default key when the client did
 		// not send one; retain that fallback without replacing an explicit raw key.
 		promptCacheKey = openAIWSPayloadString(payload, "prompt_cache_key")
+	}
+	if astraHTTPBridge {
+		promptCacheKey = bridgeRequest.executionScope
 	}
 	_, hasTools := payload["tools"]
 	debugEnabled := isOpenAIWSModeDebugEnabled()
@@ -131,7 +144,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if executionScope = strings.TrimSpace(executionScope); executionScope != "" {
 		sessionHash = executionScope
 	}
-	if turnState == "" && stateStore != nil && sessionHash != "" {
+	if !astraHTTPBridge && turnState == "" && stateStore != nil && sessionHash != "" {
 		if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, sessionHash); ok {
 			turnState = savedTurnState
 		}
@@ -143,7 +156,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 	}
 	storeDisabled := s.isOpenAIWSStoreDisabledInRequest(reqBody, account)
-	if stateStore != nil && storeDisabled && previousResponseID == "" && sessionHash != "" {
+	if !astraHTTPBridge && stateStore != nil && storeDisabled && previousResponseID == "" && sessionHash != "" {
 		if connID, ok := stateStore.GetSessionConn(groupID, sessionHash); ok {
 			preferredConnID = connID
 		}
@@ -151,6 +164,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	storeDisabledConnMode := s.openAIWSStoreDisabledConnMode()
 	forceNewConnByPolicy := shouldForceNewConnOnStoreDisabled(storeDisabledConnMode, lastFailureReason)
 	forceNewConn := forceNewConnByPolicy && storeDisabled && previousResponseID == "" && sessionHash != "" && preferredConnID == ""
+	if astraHTTPBridge {
+		storeDisabled = true
+		preferredConnID = ""
+		forceNewConn = true
+	}
 	wsHeaders, sessionResolution, buildHdrErr := s.buildOpenAIWSHeaders(
 		ctx,
 		c,
@@ -166,6 +184,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	)
 	if buildHdrErr != nil {
 		return nil, fmt.Errorf("build ws headers: %w", buildHdrErr)
+	}
+	if astraHTTPBridge {
+		wsHeaders.Set("session_id", bridgeRequest.executionScope)
+		wsHeaders.Set("conversation_id", bridgeRequest.executionScope)
+		wsHeaders.Del(openAIWSTurnStateHeader)
 	}
 	logOpenAIWSModeDebug(
 		"acquire_start account_id=%d account_type=%s transport=%s preferred_conn_id=%s has_previous_response_id=%v session_hash=%s has_turn_state=%v turn_state_len=%d has_turn_metadata=%v turn_metadata_len=%d store_disabled=%v store_disabled_conn_mode=%s retry_last_reason=%s force_new_conn=%v header_user_agent=%s header_openai_beta=%s header_originator=%s header_accept_language=%s header_session_id=%s header_conversation_id=%s session_id_source=%s conversation_id_source=%s has_prompt_cache_key=%v has_chatgpt_account_id=%v has_authorization=%v has_session_id=%v has_conversation_id=%v proxy_enabled=%v",
@@ -211,6 +234,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		},
 		PreferredConnID: preferredConnID,
 		ForceNewConn:    forceNewConn,
+		SkipPrewarm:     astraHTTPBridge,
 		ProxyURL: func() string {
 			if account.ProxyID != nil && account.Proxy != nil {
 				return account.Proxy.URL()
@@ -261,7 +285,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	// 因此 defer 中只需处理正常退出时不 MarkBroken 即可。
 	cleanExit := false
 	defer func() {
-		if !cleanExit {
+		if !cleanExit || astraHTTPBridge {
 			lease.MarkBroken()
 		}
 		lease.Release()
@@ -319,7 +343,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		handshakeTurnState != "",
 		len(handshakeTurnState),
 	)
-	if handshakeTurnState != "" {
+	if handshakeTurnState != "" && !astraHTTPBridge {
 		if stateStore != nil && sessionHash != "" {
 			stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
 		}
@@ -328,18 +352,20 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 	}
 
-	if err := s.performOpenAIWSGeneratePrewarm(
-		ctx,
-		lease,
-		decision,
-		payload,
-		previousResponseID,
-		reqBody,
-		account,
-		stateStore,
-		groupID,
-	); err != nil {
-		return nil, err
+	if !astraHTTPBridge {
+		if err := s.performOpenAIWSGeneratePrewarm(
+			ctx,
+			lease,
+			decision,
+			payload,
+			previousResponseID,
+			reqBody,
+			account,
+			stateStore,
+			groupID,
+		); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
@@ -377,6 +403,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	}
 	bufferedStreamEvents := make([][]byte, 0, 4)
 	eventCount := 0
+	lastSequenceNumber := -1
 	tokenEventCount := 0
 	terminalEventCount := 0
 	bufferedEventCount := 0
@@ -387,6 +414,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	clientDisconnected := false
 	clientDisconnectDrainStartedAt := time.Time{}
 	readTimeout := s.openAIWSReadTimeout()
+	drainTimeout := readTimeout
+	if astraHTTPBridge {
+		readTimeout = s.astraHTTPBridgeReadTimeout()
+	}
 	upstreamReadCtx := ctx
 	upstreamReadDetached := false
 	clientRequestCanceled := func() bool {
@@ -437,6 +468,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			ClientDisconnect:              clientDisconnected,
 		}
 	}
+	defer func() {
+		if astraHTTPBridge && forwardErr != nil && forwardResult == nil && (responseID != "" || usage.InputTokens > 0 || usage.OutputTokens > 0) {
+			forwardResult = resultWithUsage()
+			forwardResult.ImageCount = imageCounter.Count()
+			forwardResult.ImageOutputSizes = imageCounter.Sizes()
+		}
+	}()
 
 	var flusher http.Flusher
 	if reqStream {
@@ -483,12 +521,41 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		_, wErr := c.Writer.Write(frame)
 		if wErr == nil {
 			wroteDownstream = true
+			if astraHTTPBridge {
+				eventType := gjson.GetBytes(message, "type").String()
+				if eventType == "error" || isOpenAIWSTerminalEvent(eventType) {
+					MarkResponseCommitted(c)
+					markOpenAIWSClientVisibleFailure(c, eventType, message)
+				}
+			}
 			pendingFlushEvents++
 			flushStreamWriter(forceFlush)
 			return
 		}
 		markClientDisconnected("downstream_write_error")
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI WS Mode] client disconnected, continue draining upstream: account=%d", account.ID)
+	}
+	bridgeTerminalEmitted := false
+	defer func() {
+		// A comment commits HTTP 200, so errors after keepalive must remain SSE.
+		// Never replay a generation after a committed heartbeat.
+		if astraHTTPBridge && reqStream && forwardErr != nil && !bridgeTerminalEmitted && !clientDisconnected && c.Writer.Written() {
+			emitStreamMessage(buildAstraHTTPBridgeFailedEvent(responseID, originalModel, nil, max(eventCount, lastSequenceNumber+1)), true)
+		}
+	}()
+	emitHeartbeat := func() bool {
+		if !reqStream || clientDisconnected {
+			return false
+		}
+		if _, err := c.Writer.Write([]byte(": ping\n\n")); err != nil {
+			markClientDisconnected("downstream_heartbeat_error")
+			return false
+		}
+		// Comments never set wroteDownstream, FirstTokenMs or token counters.
+		flusher.Flush()
+		pendingFlushEvents = 0
+		lastFlushAt = time.Now()
+		return true
 	}
 	flushBufferedStreamEvents := func(reason string) {
 		if len(bufferedStreamEvents) == 0 {
@@ -517,6 +584,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	// Keep per-read timeouts unchanged for connected clients. Once a client
 	// disconnects, use the same timeout as a bounded total drain budget.
 	var pendingJSONDocuments [][]byte
+	var bridgeHeartbeatTicker *time.Ticker
+	if astraHTTPBridge && reqStream {
+		// One ticker covers the entire request. Frequent hidden in_progress
+		// events must not continually postpone the client's keepalive.
+		bridgeHeartbeatTicker = time.NewTicker(s.astraHTTPBridgeHeartbeat())
+		defer bridgeHeartbeatTicker.Stop()
+	}
 
 readLoop:
 	for {
@@ -530,7 +604,7 @@ readLoop:
 		} else {
 			currentReadTimeout := readTimeout
 			if clientDisconnected && !clientDisconnectDrainStartedAt.IsZero() {
-				remaining := readTimeout - time.Since(clientDisconnectDrainStartedAt)
+				remaining := drainTimeout - time.Since(clientDisconnectDrainStartedAt)
 				if remaining <= 0 {
 					lease.MarkBroken()
 					break readLoop
@@ -539,7 +613,11 @@ readLoop:
 					currentReadTimeout = remaining
 				}
 			}
-			message, readErr = lease.ReadMessageWithContextTimeout(upstreamReadCtx, currentReadTimeout)
+			if astraHTTPBridge && reqStream && !clientDisconnected {
+				message, readErr = readOpenAIWSWithHeartbeat(upstreamReadCtx, currentReadTimeout, bridgeHeartbeatTicker.C, lease.ReadMessageWithContextTimeout, emitHeartbeat)
+			} else {
+				message, readErr = lease.ReadMessageWithContextTimeout(upstreamReadCtx, currentReadTimeout)
+			}
 			if readErr == nil {
 				if documents, repaired := splitOpenAIConcatenatedJSONDocuments(message); repaired {
 					logOpenAIWSModeInfo(
@@ -615,6 +693,9 @@ readLoop:
 		}
 		responseModelObserver.ObserveOpenAI(message, eventType)
 		eventCount++
+		if sequence := gjson.GetBytes(message, "sequence_number"); sequence.Exists() {
+			lastSequenceNumber = max(lastSequenceNumber, int(sequence.Int()))
+		}
 		if firstEventType == "" {
 			firstEventType = eventType
 		}
@@ -726,15 +807,26 @@ readLoop:
 			setOpsUpstreamError(c, statusCode, errMsg, "")
 			if reqStream && !clientDisconnected {
 				flushBufferedStreamEvents("error_event")
-				emitStreamMessage(message, true)
+				if astraHTTPBridge {
+					emitStreamMessage(buildAstraHTTPBridgeFailedEvent(responseID, originalModel, message, max(eventCount, lastSequenceNumber+1)), true)
+				} else {
+					emitStreamMessage(message, true)
+				}
+				bridgeTerminalEmitted = true
 			}
 			if !reqStream {
+				if astraHTTPBridge {
+					c.Header("Content-Type", "application/json; charset=utf-8")
+				}
 				c.JSON(statusCode, gin.H{
 					"error": gin.H{
 						"type":    "upstream_error",
 						"message": errMsg,
 					},
 				})
+				if astraHTTPBridge {
+					MarkResponseCommitted(c)
+				}
 			}
 			return nil, fmt.Errorf("openai ws error event: %s", errMsg)
 		}
@@ -770,6 +862,7 @@ readLoop:
 		}
 
 		if isTerminalEvent {
+			bridgeTerminalEmitted = true
 			if !clientDisconnected {
 				markOpenAIWSClientVisibleFailure(c, eventType, message)
 			}
@@ -819,12 +912,14 @@ readLoop:
 		flushStreamWriter(true)
 	}
 
-	if responseID != "" && stateStore != nil {
+	if astraHTTPBridge {
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	} else if responseID != "" && stateStore != nil {
 		ttl := s.openAIWSResponseStickyTTL()
 		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 		stateStore.BindResponseConn(responseID, lease.ConnID(), ttl)
 	}
-	if stateStore != nil && storeDisabled && sessionHash != "" {
+	if !astraHTTPBridge && stateStore != nil && storeDisabled && sessionHash != "" {
 		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), s.openAIWSSessionStickyTTL())
 	}
 	firstTokenMsValue := -1

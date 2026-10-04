@@ -1257,6 +1257,15 @@ const DefaultOpenAIWSClientFirstMessageTimeoutSeconds = 30
 // GatewayOpenAIWSConfig OpenAI Responses WebSocket 配置。
 // 注意：默认全局开启；如需回滚可使用 force_http 或关闭 enabled。
 type GatewayOpenAIWSConfig struct {
+	// AstraHTTPBridgeEnabled is an experimental, default-off Responses HTTP/SSE
+	// to WSv2 bridge. It also requires an explicit OAuth account opt-in.
+	AstraHTTPBridgeEnabled bool `mapstructure:"astra_http_bridge_enabled"`
+	// Empty allows all authenticated keys on opted-in accounts; nonempty
+	// limits an experiment to explicit downstream API key IDs.
+	AstraHTTPBridgeAPIKeyIDs []int64 `mapstructure:"astra_http_bridge_api_key_ids"`
+	// Independent from ingress WS deadlines; experiments may need longer reasoning.
+	AstraHTTPBridgeReadTimeoutSeconds int `mapstructure:"astra_http_bridge_read_timeout_seconds"`
+	AstraHTTPBridgeHeartbeatSeconds   int `mapstructure:"astra_http_bridge_heartbeat_seconds"`
 	// ModeRouterV2Enabled: 新版 WS mode 路由开关（默认 false；关闭时保持 legacy 行为）
 	ModeRouterV2Enabled bool `mapstructure:"mode_router_v2_enabled"`
 	// IngressModeDefault: ingress 默认模式（off/ctx_pool/passthrough/http_bridge）
@@ -2436,6 +2445,10 @@ func setDefaults() {
 	viper.SetDefault("gateway.live.max_session_duration_seconds", 3600)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
 	viper.SetDefault("gateway.openai_ws.enabled", true)
+	viper.SetDefault("gateway.openai_ws.astra_http_bridge_enabled", false)
+	viper.SetDefault("gateway.openai_ws.astra_http_bridge_api_key_ids", []int64{})
+	viper.SetDefault("gateway.openai_ws.astra_http_bridge_read_timeout_seconds", 3600)
+	viper.SetDefault("gateway.openai_ws.astra_http_bridge_heartbeat_seconds", 15)
 	viper.SetDefault("gateway.openai_ws.mode_router_v2_enabled", false)
 	viper.SetDefault("gateway.openai_ws.ingress_mode_default", "ctx_pool")
 	viper.SetDefault("gateway.openai_ws.client_first_message_timeout_seconds", DefaultOpenAIWSClientFirstMessageTimeoutSeconds)
@@ -3492,6 +3505,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.OpenAIWS.ReadTimeoutSeconds <= 0 {
 		return fmt.Errorf("gateway.openai_ws.read_timeout_seconds must be positive")
+	}
+	if c.Gateway.OpenAIWS.AstraHTTPBridgeEnabled &&
+		(c.Gateway.OpenAIWS.AstraHTTPBridgeReadTimeoutSeconds <= 0 || c.Gateway.OpenAIWS.AstraHTTPBridgeHeartbeatSeconds <= 0) {
+		return fmt.Errorf("enabled Astra HTTP bridge requires positive read_timeout and heartbeat seconds")
+	}
+	for _, id := range c.Gateway.OpenAIWS.AstraHTTPBridgeAPIKeyIDs {
+		if id <= 0 {
+			return fmt.Errorf("Astra HTTP bridge API key IDs must be positive")
+		}
 	}
 	if c.Gateway.OpenAIWS.WriteTimeoutSeconds <= 0 {
 		return fmt.Errorf("gateway.openai_ws.write_timeout_seconds must be positive")
