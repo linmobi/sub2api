@@ -91,3 +91,18 @@ sudo certbot renew --dry-run --cert-name ai.lin.mobi --run-deploy-hooks
 2026-10-04 验证结果：78 项路径检查通过；公网面板登录和后台设置读取通过；使用现有密钥在 API 域名读取 Anthropic、OpenAI 模型目录成功，同一密钥在面板域名调用模型目录返回 404；其他子域名返回零内容。SSL 续期演练在域名隔离前通过，隔离后确认 DNS 验证配置、续期重载脚本和定时器保持正常。未为这些检查发起收费模型生成请求。
 
 同日开启面板 CDN 后，重新通过 78 项路径检查；面板登录和当前用户接口返回 200 且不缓存；版本化 JS 资源出现 `MISS → HIT → HIT`。默认 Python-urllib 客户端携带合法密钥直接读取 Anthropic（13 个）和 OpenAI（10 个）模型成功，响应无 Cloudflare 标识。面板检查客户端设置了明确的 User-Agent；普通脚本访问面板仍可能触发现有 Cloudflare 防护，不影响仅 DNS 的模型 API。
+
+## OpenAI 上游流式连接
+
+2026-10-04，Astra 的两次长请求在约 15–16 分钟后出现 `stream error: ... INTERNAL_ERROR; received from peer`，客户端收到 `Upstream HTTP/2 stream failed`。错误发生在 Sub2API 读取 OpenAI 上游响应时。API 域名为仅 DNS，客户端到 Sub2API 的入站协议不控制这条上游连接。
+
+本实例已采用 `openai-upstream.env.example` 中的配置，让 OpenAI 上游使用 HTTP/1.1，继续向客户端发送流式响应。将该变量合并到应用 `env_file` 指定的 `/opt/sub2api/.env`，不要用示例文件覆盖整个生产环境文件。确认没有活跃请求并备份环境文件后，重新创建仅应用服务以加载新变量：
+
+```bash
+cd /opt/sub2api
+docker compose -p sub2api-production up -d --no-deps --no-build --pull never sub2api
+```
+
+重建应用会短暂中断访问，因此应避开活跃生成请求。仅执行 `restart` 不会更新容器环境变量。回退时恢复原环境文件，或设 `GATEWAY_OPENAI_HTTP2_ENABLED=true`，再重新创建应用服务。
+
+应用加载新配置后健康检查返回 200，一次低推理强度的 Astra 短请求约 4.73 秒完成，收到 `response.completed`。此验证确认流式调用可以完整结束，尚未验证与原请求相同的长任务。配置备份和验证记录保存在虚拟机 `/opt/sub2api/public-deployment/`，不提交生产凭据或真实聊天内容。
