@@ -1,9 +1,10 @@
 # Astra HTTP/SSE to WSv2 experiment
 
-This is a default-off experiment for the observed OpenAI HTTP stream closure
-near 901 seconds. It is not evidence that WebSocket generation will outlast
-that limit. Validate in isolation before an explicitly limited canary, then
-complete a real long request before describing the interruption as fixed.
+This default-off experiment addresses the observed OpenAI HTTP stream closure
+near 901 seconds. The limited canary described below completed a real request
+lasting approximately 23 minutes. Validate additional clients and inputs
+before a broader rollout; one successful case is not a universal upstream
+lifetime guarantee.
 
 The bridge applies only to HTTP `/v1/responses` (including compatible prefixed
 Responses routes), exact `gpt-6-astra` with no model remapping, and explicitly
@@ -98,8 +99,8 @@ against the real ChatGPT OAuth WebSocket upstream using synthetic `17 + 23`,
 private pooled connection. Its credentials were read only inside the server
 from a protected temporary file, then that file and harness were removed.
 The live test did not modify the production account or application settings.
-This verifies short-request compatibility only; a real long request remains
-required to establish whether the original 901-second interruption is avoided.
+This harness verified short-request compatibility. The subsequent deployment
+and real long-request validation are documented below.
 
 The final selected regression run used Go 1.27.1 in a container capped at one
 CPU and 2 GiB memory, with memory-swap also capped at 2 GiB. It exited 0 without
@@ -115,3 +116,39 @@ use the repository's `embed` build tag and the current custom frontend assets.
 Roll back the experiment by disabling its global flag. Account extras can also
 be removed. Keep the deployment's other environment variables and database
 unchanged.
+
+The limited deployment canary on 2026-10-04 used a binary built from commit
+`20532d160854803959ac4b6874f9217c350ae77c`, with the existing runtime image and
+custom frontend retained. Its public HTTPS Responses API passed the same
+synthetic `17 + 23` check in 2.551 seconds, with one completed event, no failure
+event, and the correct answer. The resulting usage record confirmed
+`openai_ws_mode=true` and `request_type=ws_v2`. The canary was limited to API
+key 1 and the opted-in OAuth account; PostgreSQL, Redis, Nginx and the tunnel
+were not restarted. The short check verified deployment and transport before
+the user initiated the long-request test.
+
+The subsequent real Cherry Studio test used `gpt-6-astra` in ordinary assistant
+mode with the user's original `max` setting. It ran for 1380.716 seconds
+(approximately 23 minutes) before the HTTP request completed, with no gateway
+stream error. Its usage record confirmed `ws_v2` and the same upstream model.
+The user confirmed the complete reply arrived in Cherry Studio without an
+error. TCP metadata independently showed the same upstream and tunnel flows
+continuing to carry data beyond both 901 and 1200 seconds, with no reset.
+At completion the VM initiated the upstream TCP close, unlike the previous
+HTTP reproduction where the upstream peer closed first at approximately
+901 seconds. Both bounded diagnostic captures then stopped and reaped their
+own tcpdump processes, with no forced kill, no kernel drops and no persisted
+application payload.
+
+This validates the observed long-request case on the explicitly limited
+canary. It does not identify OpenAI's internal reason for closing the original
+HTTP connection or establish a universal official 15-minute policy. Keep the
+global default disabled; the current deployment opts in only the tested key
+and account. The full-input, continuation and connection/cache tradeoffs above
+still apply.
+
+Operational rollback must restore the previous application image, the four
+experiment environment settings and the previous presence/value of the two
+account flags. Merge restored flags into the account's current Extra map,
+preserving newer quota and model-directory updates. Take a recoverable backup
+first and switch the application only during a confirmed quiet window.
