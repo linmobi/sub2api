@@ -11,9 +11,18 @@ func TestAstraHTTPBridge_DefaultDisabledKeepsLegacyDeadline(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.False(t, cfg.Gateway.OpenAIWS.AstraHTTPBridgeEnabled)
+	require.True(t, cfg.Gateway.OpenAIWS.CtxPoolHTTPBridgeEnabled)
 	require.Equal(t, 900, cfg.Gateway.OpenAIWS.ReadTimeoutSeconds)
 	require.Equal(t, 3600, cfg.Gateway.OpenAIWS.AstraHTTPBridgeReadTimeoutSeconds)
 	require.Equal(t, 15, cfg.Gateway.OpenAIWS.AstraHTTPBridgeHeartbeatSeconds)
+}
+
+func TestCtxPoolHTTPBridge_ExplicitDisable(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_OPENAI_WS_CTX_POOL_HTTP_BRIDGE_ENABLED", "false")
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.False(t, cfg.Gateway.OpenAIWS.CtxPoolHTTPBridgeEnabled)
 }
 
 func TestAstraHTTPBridge_ExplicitEnvAndInvalidDeadline(t *testing.T) {

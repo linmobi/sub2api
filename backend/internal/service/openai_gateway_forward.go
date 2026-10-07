@@ -119,9 +119,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		wsExecutionScope = bridgeScope
 		wsDecision.Reason = "experimental_astra_http_bridge"
+		if s.cfg.Gateway.OpenAIWS.CtxPoolHTTPBridgeEnabled && account.ResolveOpenAIResponsesWebSocketV2Mode(s.cfg.Gateway.OpenAIWS.IngressModeDefault) == "ctx_pool" {
+			wsDecision.Reason = "ctx_pool_http_bridge"
+		}
 	} else {
-		// HTTP keeps its established upstream protocol unless every experimental
-		// gate above is explicitly enabled for this account and model.
+		// Ineligible HTTP requests retain their existing protocol and state handling.
 		wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c))
 	}
 	passthroughEnabled := account.IsOpenAIPassthroughEnabled()

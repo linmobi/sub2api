@@ -1257,6 +1257,9 @@ const DefaultOpenAIWSClientFirstMessageTimeoutSeconds = 30
 // GatewayOpenAIWSConfig OpenAI Responses WebSocket 配置。
 // 注意：默认全局开启；如需回滚可使用 force_http 或关闭 enabled。
 type GatewayOpenAIWSConfig struct {
+	// CtxPoolHTTPBridgeEnabled automatically bridges full-input HTTP Responses
+	// for OAuth accounts in ctx_pool mode, independently of the legacy canary.
+	CtxPoolHTTPBridgeEnabled bool `mapstructure:"ctx_pool_http_bridge_enabled"`
 	// AstraHTTPBridgeEnabled is an experimental, default-off Responses HTTP/SSE
 	// to WSv2 bridge. It also requires an explicit OAuth account opt-in.
 	AstraHTTPBridgeEnabled bool `mapstructure:"astra_http_bridge_enabled"`
@@ -2446,6 +2449,7 @@ func setDefaults() {
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
 	viper.SetDefault("gateway.openai_ws.enabled", true)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_enabled", false)
+	viper.SetDefault("gateway.openai_ws.ctx_pool_http_bridge_enabled", true)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_api_key_ids", []int64{})
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_read_timeout_seconds", 3600)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_heartbeat_seconds", 15)

@@ -18,14 +18,26 @@ type openAIAstraHTTPBridgeRequest struct {
 	executionScope string
 }
 
-// Deliberately narrow experimental gate. Passthrough and other HTTP endpoints
-// retain their existing protocol, even when a model name happens to match.
+// ctx_pool bridges full-input Responses for every model and downstream key.
+// Stateful continuations retain HTTP because a fresh private socket cannot
+// safely reconstruct upstream stored state. The original canary remains
+// available when automatic bridging is disabled.
 func (s *OpenAIGatewayService) shouldBridgeAstraHTTP(c *gin.Context, account *Account, body []byte, decision OpenAIWSProtocolDecision) bool {
-	if s == nil || s.cfg == nil || !s.cfg.Gateway.OpenAIWS.AstraHTTPBridgeEnabled || c == nil || c.Request == nil ||
+	if s == nil || s.cfg == nil || c == nil || c.Request == nil ||
 		GetOpenAIClientTransport(c) != OpenAIClientTransportHTTP || getAPIKeyIDFromContext(c) <= 0 ||
 		account == nil || !account.IsOpenAIOAuth() || account.IsOpenAIPassthroughEnabled() ||
 		!account.IsOpenAIResponsesWebSocketV2Enabled() || decision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 ||
 		isOpenAIResponsesCompactPath(c) || !strings.HasSuffix(strings.TrimRight(c.Request.URL.Path, "/"), "/responses") {
+		return false
+	}
+	mode := account.ResolveOpenAIResponsesWebSocketV2Mode(s.cfg.Gateway.OpenAIWS.IngressModeDefault)
+	if mode == "off" {
+		return false
+	}
+	if s.cfg.Gateway.OpenAIWS.CtxPoolHTTPBridgeEnabled && mode == "ctx_pool" {
+		return strings.TrimSpace(gjson.GetBytes(body, "model").String()) != "" && openAIHTTPBridgeContinuationParam(body) == ""
+	}
+	if !s.cfg.Gateway.OpenAIWS.AstraHTTPBridgeEnabled {
 		return false
 	}
 	optIn, _ := account.Extra["openai_astra_http_ws_bridge_enabled"].(bool)
@@ -74,7 +86,7 @@ func buildAstraHTTPBridgeFailedEvent(responseID, model string, source []byte, se
 	return payload
 }
 
-func prepareOpenAIAstraHTTPBridge(c *gin.Context, account *Account, body []byte, rawScope string) (string, error) {
+func openAIHTTPBridgeContinuationParam(body []byte) string {
 	rejectedParam := ""
 	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
 		rejectedParam = "previous_response_id"
@@ -90,8 +102,13 @@ func prepareOpenAIAstraHTTPBridge(c *gin.Context, account *Account, body []byte,
 		}
 		return true
 	})
+	return rejectedParam
+}
+
+func prepareOpenAIAstraHTTPBridge(c *gin.Context, account *Account, body []byte, rawScope string) (string, error) {
+	rejectedParam := openAIHTTPBridgeContinuationParam(body)
 	if rejectedParam != "" {
-		err := fmt.Errorf("experimental Astra HTTP bridge requires full input; %s is unsupported", rejectedParam)
+		err := fmt.Errorf("OpenAI HTTP WebSocket bridge requires full input; %s is unsupported", rejectedParam)
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"type": "invalid_request_error", "message": err.Error(), "param": rejectedParam}})
 		MarkResponseCommitted(c)
 		return "", err
