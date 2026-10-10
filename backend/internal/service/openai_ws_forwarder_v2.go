@@ -990,4 +990,3 @@ func stripCodexSparkImageGenerationToolFromRawPayload(payload []byte, model stri
 	}
 	return stripOpenAIImageGenerationToolsFromRawPayload(payload)
 }
-
