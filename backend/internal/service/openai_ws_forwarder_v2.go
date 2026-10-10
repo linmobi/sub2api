@@ -668,7 +668,7 @@ readLoop:
 				serviceTier = *value
 			}
 			logOpenAIWSModeInfo(
-				"read_fail account_id=%d conn_id=%s wrote_downstream=%v close_status=%s close_reason=%s cause=%s events=%d token_events=%d terminal_events=%d buffered_pending=%d buffered_flushed=%d first_event=%s last_event=%s event_types=%s last_item_type=%s last_item_status=%s reasoning_effort=%s service_tier=%s ws_extensions=%s",
+				"read_fail account_id=%d conn_id=%s wrote_downstream=%v close_status=%s close_reason=%s cause=%s events=%d token_events=%d terminal_events=%d buffered_pending=%d buffered_flushed=%d first_event=%s last_event=%s event_types=%s last_item_type=%s last_item_status=%s reasoning_effort=%s service_tier=%s ws_extensions=%s upstream_request_id=%s upstream_cf_ray=%s response_id=%s",
 				account.ID,
 				connID,
 				wroteDownstream,
@@ -688,6 +688,9 @@ readLoop:
 				truncateOpenAIWSLogValue(reasoningEffort, 32),
 				truncateOpenAIWSLogValue(serviceTier, 32),
 				truncateOpenAIWSLogValue(lease.HandshakeHeader("Sec-WebSocket-Extensions"), 128),
+				truncateOpenAIWSLogValue(lease.HandshakeHeader("X-Request-ID"), 128),
+				truncateOpenAIWSLogValue(lease.HandshakeHeader("CF-Ray"), 128),
+				truncateOpenAIWSLogValue(responseID, 128),
 			)
 			if clientDisconnected {
 				if !readUsedDetachedContext && errors.Is(readErr, context.Canceled) && clientRequestCanceled() {
