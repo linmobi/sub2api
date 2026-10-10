@@ -410,6 +410,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	flushedBufferedEventCount := 0
 	firstEventType := ""
 	lastEventType := ""
+	// Keep structural diagnostics only; never retain event contents or tool arguments.
+	eventTypeCounts := make(map[string]int)
+	lastOutputItemType := ""
+	lastOutputItemStatus := ""
 	upstreamTerminalEvent := ""
 	clientDisconnected := false
 	clientDisconnectDrainStartedAt := time.Time{}
@@ -655,8 +659,16 @@ readLoop:
 		if readErr != nil {
 			lease.MarkBroken()
 			closeStatus, closeReason := summarizeOpenAIWSReadCloseError(readErr)
+			eventCountsJSON, _ := json.Marshal(eventTypeCounts)
+			reasoningEffort, serviceTier := "", ""
+			if value := extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel); value != nil {
+				reasoningEffort = *value
+			}
+			if value := extractOpenAIServiceTier(reqBody); value != nil {
+				serviceTier = *value
+			}
 			logOpenAIWSModeInfo(
-				"read_fail account_id=%d conn_id=%s wrote_downstream=%v close_status=%s close_reason=%s cause=%s events=%d token_events=%d terminal_events=%d buffered_pending=%d buffered_flushed=%d first_event=%s last_event=%s",
+				"read_fail account_id=%d conn_id=%s wrote_downstream=%v close_status=%s close_reason=%s cause=%s events=%d token_events=%d terminal_events=%d buffered_pending=%d buffered_flushed=%d first_event=%s last_event=%s event_types=%s last_item_type=%s last_item_status=%s reasoning_effort=%s service_tier=%s ws_extensions=%s",
 				account.ID,
 				connID,
 				wroteDownstream,
@@ -670,6 +682,12 @@ readLoop:
 				flushedBufferedEventCount,
 				truncateOpenAIWSLogValue(firstEventType, openAIWSLogValueMaxLen),
 				truncateOpenAIWSLogValue(lastEventType, openAIWSLogValueMaxLen),
+				string(eventCountsJSON),
+				truncateOpenAIWSLogValue(lastOutputItemType, 64),
+				truncateOpenAIWSLogValue(lastOutputItemStatus, 32),
+				truncateOpenAIWSLogValue(reasoningEffort, 32),
+				truncateOpenAIWSLogValue(serviceTier, 32),
+				truncateOpenAIWSLogValue(lease.HandshakeHeader("Sec-WebSocket-Extensions"), 128),
 			)
 			if clientDisconnected {
 				if !readUsedDetachedContext && errors.Is(readErr, context.Canceled) && clientRequestCanceled() {
@@ -700,6 +718,14 @@ readLoop:
 			firstEventType = eventType
 		}
 		lastEventType = eventType
+		eventTypeKey := truncateOpenAIWSLogValue(eventType, 96)
+		if len(eventTypeCounts) < 64 || eventTypeCounts[eventTypeKey] > 0 {
+			eventTypeCounts[eventTypeKey]++
+		}
+		if eventType == "response.output_item.added" || eventType == "response.output_item.done" {
+			lastOutputItemType = gjson.GetBytes(message, "item.type").String()
+			lastOutputItemStatus = gjson.GetBytes(message, "item.status").String()
+		}
 
 		if responseID == "" && eventResponseID != "" {
 			responseID = eventResponseID
@@ -964,3 +990,4 @@ func stripCodexSparkImageGenerationToolFromRawPayload(payload []byte, model stri
 	}
 	return stripOpenAIImageGenerationToolsFromRawPayload(payload)
 }
+
