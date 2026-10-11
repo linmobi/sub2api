@@ -298,6 +298,7 @@ type OpenAIForwardResult struct {
 
 	wsReplayInput                []json.RawMessage
 	wsReplayInputExists          bool
+	wsLifetimeOutput             []json.RawMessage
 	wsAccountFailoverReplayInput []json.RawMessage
 }
 

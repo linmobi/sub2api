@@ -1255,6 +1255,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					Duration:                      time.Since(turnStart),
 					FirstTokenMs:                  firstTokenMs,
 				}
+				result.wsLifetimeOutput = replayCollector.AllItems()
 				if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 					result.wsReplayInput = replayInput
 					result.wsReplayInputExists = true
@@ -1347,6 +1348,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	var lastTurnStrictState *openAIWSIngressPreviousTurnStrictState
 	lastTurnReplayInput := []json.RawMessage(nil)
 	lastTurnReplayInputExists := false
+	lastTurnReplayHistoryComplete := false
+	lastTurnLifetimeInput := []json.RawMessage(nil)
+	lastTurnLifetimeInputExists := false
 	currentTurnReplayInput := []json.RawMessage(nil)
 	currentTurnReplayInputExists := false
 	skipBeforeTurn := false
@@ -1664,6 +1668,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 		}
+		// Keep complete output history for planned rotation separately from the
+		// existing tool-only error-recovery sequence, preserving its semantics.
+		lifetimeInput, lifetimeInputExists, lifetimeInputErr := buildOpenAIWSReplayInputSequence(
+			lastTurnLifetimeInput, lastTurnLifetimeInputExists, currentPayload, currentPreviousResponseID != "",
+		)
+		currentReplayHistoryComplete := lifetimeInputErr == nil && (currentPreviousResponseID == "" ||
+			(lastTurnReplayHistoryComplete && currentPreviousResponseID == lastTurnResponseID))
 		forcePreferredConn := isStrictAffinityTurn(currentPayload)
 		if sessionLease == nil {
 			acquiredLease, acquireErr := acquireTurnLease(turn, preferredConnID, forcePreferredConn, turnRetry > 0)
@@ -1676,6 +1687,38 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				pinSessionConn(sessionConnID)
 			} else {
 				unpinSessionConn(sessionConnID)
+			}
+		}
+		// A client socket can outlive many upstream sockets. Only rotate before
+		// sending the next turn; never interrupt or replay an active generation.
+		if sessionLease.conn != nil && sessionLease.conn.age(time.Now()) >= openAIWSConnRenewAfter {
+			rotatedPayload, safe, rotationErr := prepareOpenAIWSLifetimeRotationPayload(
+				currentPayload, lifetimeInput, lifetimeInputExists,
+				currentReplayHistoryComplete, storeDisabled,
+			)
+			if rotationErr != nil {
+				return fmt.Errorf("prepare websocket lifetime rotation: %w", rotationErr)
+			}
+			if safe {
+				oldConnID := sessionConnID
+				age := sessionLease.conn.age(time.Now())
+				resetSessionLease(true)
+				currentPayload = rotatedPayload
+				currentPayloadBytes = len(rotatedPayload)
+				currentPreviousResponseID = openAIWSPayloadStringFromRaw(rotatedPayload, "previous_response_id")
+				forcePreferredConn = isStrictAffinityTurn(rotatedPayload)
+				acquiredLease, acquireErr := acquireTurnLease(turn, "", false, true)
+				if acquireErr != nil {
+					return fmt.Errorf("acquire upstream websocket for lifetime rotation: %w", acquireErr)
+				}
+				sessionLease = acquiredLease
+				sessionConnID = strings.TrimSpace(sessionLease.ConnID())
+				if storeDisabled {
+					pinSessionConn(sessionConnID)
+				}
+				logOpenAIWSModeInfo("ingress_ws_lifetime_rotated account_id=%d turn=%d old_conn_id=%s conn_id=%s age_ms=%d history_items=%d", account.ID, turn, oldConnID, sessionConnID, age.Milliseconds(), len(lifetimeInput))
+			} else {
+				logOpenAIWSModeInfo("ingress_ws_lifetime_rotation_deferred account_id=%d turn=%d conn_id=%s reason=incomplete_or_external_history", account.ID, turn, sessionConnID)
 			}
 		}
 		shouldPreflightPing := turn > 1 && sessionLease != nil && sessionLease.SupportsIdlePingWithoutReader() && turnRetry == 0
@@ -1857,6 +1900,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// collector 增量经 combine 合并（新头数组）。
 		lastTurnReplayInput = currentTurnReplayInput
 		lastTurnReplayInputExists = currentTurnReplayInputExists
+		lastTurnReplayHistoryComplete = currentReplayHistoryComplete
+		lastTurnLifetimeInput = combineOpenAIWSReplayItems(lifetimeInput, result.wsLifetimeOutput)
+		lastTurnLifetimeInputExists = lifetimeInputExists || len(result.wsLifetimeOutput) > 0
 		if result.wsReplayInputExists {
 			lastTurnReplayInput = combineOpenAIWSReplayItems(lastTurnReplayInput, result.wsReplayInput)
 			lastTurnReplayInputExists = true
