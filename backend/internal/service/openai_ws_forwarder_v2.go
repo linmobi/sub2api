@@ -829,11 +829,29 @@ readLoop:
 			}
 			// error 事件后连接不再可复用，避免回池后污染下一请求。
 			lease.MarkBroken()
-			if !wroteDownstream && canFallback {
+			// The private HTTP bridge must expose a semantic upstream rejection,
+			// rather than relabel it as a transport interruption or replay it.
+			if !wroteDownstream && canFallback && !(astraHTTPBridge && fallbackReason == "upstream_error_event") {
 				return nil, wrapOpenAIWSFallback(fallbackReason, errors.New(errMsg))
 			}
 			statusCode := openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
 			setOpsUpstreamError(c, statusCode, errMsg, "")
+			if astraHTTPBridge && !clientDisconnected && !c.Writer.Written() {
+				// No SSE bytes have been committed: preserve the upstream rejection
+				// as an ordinary HTTP error, including its actionable error code.
+				fields := gin.H{"type": firstNonEmpty(errTypeRaw, "upstream_error"), "message": errMsg}
+				if errCodeRaw != "" {
+					fields["code"] = errCodeRaw
+				}
+				if param := gjson.GetBytes(message, "error.param"); param.Exists() {
+					fields["param"] = param.Value()
+				}
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				c.JSON(statusCode, gin.H{"error": fields})
+				MarkResponseCommitted(c)
+				bridgeTerminalEmitted = true
+				return nil, fmt.Errorf("openai ws error event: %s", errMsg)
+			}
 			if reqStream && !clientDisconnected {
 				flushBufferedStreamEvents("error_event")
 				if astraHTTPBridge {

@@ -560,7 +560,8 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 			writeChatCompletionsError(c, status, errType, errMsg)
 			return nil, fmt.Errorf("upstream response failed (passthrough): %s", errMsg)
 		}
-		writeChatCompletionsError(c, http.StatusBadGateway, "upstream_error", message)
+		status, errType := openAIChatSemanticErrorDefaults(payload, message)
+		writeChatCompletionsSemanticError(c, status, errType, message, payload)
 		return nil, fmt.Errorf("upstream response failed: %s", message)
 	}
 	if strings.TrimSpace(finalResponse.Status) == "completed" {
@@ -806,7 +807,8 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				return true
 			}
 			message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payloadBytes, message)
-			defaultStatus, defaultErrType, defaultMsg := http.StatusBadGateway, "upstream_error", message
+			defaultStatus, defaultErrType := openAIChatSemanticErrorDefaults(payloadBytes, message)
+			defaultMsg := message
 			// 统一走语义状态推断 + body 归一化（与 /v1/responses 路径一致），
 			// 使按错误码配置的透传规则可命中。
 			if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(
@@ -818,14 +820,9 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				defaultStatus, defaultErrType, defaultMsg = status, errType, errMsg
 				MarkResponseCommitted(c)
 			}
-			errorPayload, _ := json.Marshal(gin.H{
-				"error": gin.H{
-					"type":    defaultErrType,
-					"message": defaultMsg,
-				},
-			})
+			errorPayload, _ := json.Marshal(gin.H{"error": openAIChatErrorFields(defaultErrType, defaultMsg, payloadBytes)})
 			if c != nil && c.Writer != nil && !c.Writer.Written() {
-				writeChatCompletionsError(c, defaultStatus, defaultErrType, defaultMsg)
+				writeChatCompletionsSemanticError(c, defaultStatus, defaultErrType, defaultMsg, payloadBytes)
 				clientOutputStarted = true
 			} else if c != nil && c.Writer != nil && !clientDisconnected {
 				if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", errorPayload); err != nil {
@@ -1150,13 +1147,30 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 }
 
 // writeChatCompletionsError writes an error response in OpenAI Chat Completions format.
+func openAIChatSemanticErrorDefaults(payload []byte, message string) (int, string) {
+	if isOpenAIContextWindowError(message, payload) {
+		return http.StatusBadRequest, "invalid_request_error"
+	}
+	return http.StatusBadGateway, "upstream_error"
+}
+
+func openAIChatErrorFields(errType, message string, sources ...[]byte) gin.H {
+	fields := gin.H{"type": errType, "message": message}
+	if len(sources) > 0 && isOpenAIContextWindowError(message, sources[0]) {
+		fields["code"] = "context_length_exceeded"
+		fields["param"] = "input"
+	}
+	return fields
+}
+
 func writeChatCompletionsError(c *gin.Context, statusCode int, errType, message string) {
+	writeChatCompletionsSemanticError(c, statusCode, errType, message, nil)
+}
+
+func writeChatCompletionsSemanticError(c *gin.Context, statusCode int, errType, message string, source []byte) {
 	MarkResponseCommitted(c)
 	c.JSON(statusCode, gin.H{
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
+		"error": openAIChatErrorFields(errType, message, source),
 	})
 }
 

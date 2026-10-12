@@ -203,13 +203,11 @@ func TestAstraHTTPBridge_UpstreamErrorDoesNotDuplicateOrMixProtocols(t *testing.
 		require.Error(t, err)
 		require.True(t, IsResponseCommitted(c))
 		require.Equal(t, 1, strings.Count(rec.Body.String(), "synthetic rejected input"))
-		if !stream {
-			require.NotContains(t, rec.Body.String(), "data:")
-			require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
-		} else {
-			require.NotContains(t, rec.Body.String(), "upstream_stream_interrupted")
-			require.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"response.failed"`))
-		}
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.NotContains(t, rec.Body.String(), "data:")
+		require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+		require.Equal(t, "invalid_request_error", gjson.Get(rec.Body.String(), "error.code").String())
+		require.NotContains(t, rec.Body.String(), "upstream_stream_interrupted")
 	}
 }
 
