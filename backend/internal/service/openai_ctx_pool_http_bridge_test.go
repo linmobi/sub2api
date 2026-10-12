@@ -100,3 +100,40 @@ func TestCtxPoolHTTPBridge_MappedModelAndInterruptedStream(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), `"type":"response.completed"`)
 	require.True(t, conn.closed)
 }
+
+func TestCtxPoolHTTPBridge_PreservesSemanticServerErrorWithoutReplay(t *testing.T) {
+	conn := &openAIWSCaptureConn{events: [][]byte{[]byte(`{"type":"error","error":{"code":"server_error","type":"server_error","message":"synthetic upstream processing failure"}}`)}}
+	svc, account, c, rec, dialer := astraHTTPBridgeFixture(t, conn)
+	svc.cfg.Gateway.OpenAIWS.CtxPoolHTTPBridgeEnabled = true
+	svc.cfg.Gateway.OpenAIWS.AstraHTTPBridgeEnabled = false
+	account.Extra["openai_oauth_responses_websockets_v2_mode"] = "ctx_pool"
+	_, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-6.1-sol","stream":true,"input":"synthetic"}`))
+	require.Error(t, err)
+	require.Equal(t, 1, dialer.DialCount())
+	require.Nil(t, svc.httpUpstream.(*httpUpstreamRecorder).lastReq)
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.True(t, gjson.Valid(rec.Body.String()))
+	require.Contains(t, rec.Body.String(), `"code":"server_error"`)
+	require.Contains(t, rec.Body.String(), "synthetic upstream processing failure")
+	require.NotContains(t, rec.Body.String(), "upstream_stream_interrupted")
+	require.Equal(t, "server_error", gjson.Get(rec.Body.String(), "error.type").String())
+	require.True(t, conn.closed)
+}
+
+func TestChatCompletionsContextErrorPreservesBareAndTerminalErrorCodes(t *testing.T) {
+	for _, source := range []string{
+		`{"type":"error","error":{"code":"context_length_exceeded","type":"invalid_request_error","param":"input","message":"Your input exceeds the context window of this model."}}`,
+		`{"type":"response.failed","response":{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"Your input exceeds the context window of this model."}}}`,
+	} {
+		payload := []byte(source)
+		message := "Your input exceeds the context window of this model."
+		require.Equal(t, http.StatusBadRequest, openAIStreamFailureStatus(payload, message))
+		status, errType := openAIChatSemanticErrorDefaults(payload, message)
+		require.Equal(t, http.StatusBadRequest, status)
+		fields := openAIChatErrorFields(errType, message, payload)
+		require.Equal(t, "invalid_request_error", fields["type"])
+		require.Equal(t, "context_length_exceeded", fields["code"])
+		require.Equal(t, "input", fields["param"])
+		require.False(t, openAIStreamErrorEventShouldFailover(payload, message))
+	}
+}

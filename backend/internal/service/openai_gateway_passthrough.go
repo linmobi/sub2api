@@ -1430,6 +1430,10 @@ func openAIStreamFailureStatus(payload []byte, message string) int {
 		return http.StatusBadGateway
 	}
 	semanticStatus := openAIStreamFailedEventSemanticStatus(payload, message)
+	// A context rejection is a request error, not a retryable transport failure.
+	if isOpenAIContextWindowError(message, payload) {
+		return http.StatusBadRequest
+	}
 	switch semanticStatus {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, 529:
 		return semanticStatus
