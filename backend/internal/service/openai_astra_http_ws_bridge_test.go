@@ -154,7 +154,9 @@ func TestAstraHTTPBridge_RejectsContinuationBeforeDial(t *testing.T) {
 	require.True(t, IsResponseCommitted(c))
 	require.Contains(t, rec.Body.String(), "full input")
 	require.Zero(t, dialer.DialCount())
-	require.Nil(t, svc.httpUpstream.(*httpUpstreamRecorder).lastReq)
+	httpClient, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+	require.True(t, ok)
+	require.Nil(t, httpClient.lastReq)
 }
 
 func TestAstraHTTPBridge_RequestScopeCannotBeShared(t *testing.T) {
@@ -316,7 +318,9 @@ func TestAstraHTTPBridge_RejectsOtherServerHistoryReferences(t *testing.T) {
 			require.Contains(t, rec.Body.String(), tc.param)
 			require.True(t, IsResponseCommitted(c))
 			require.Zero(t, dialer.DialCount())
-			require.Nil(t, svc.httpUpstream.(*httpUpstreamRecorder).lastReq)
+			httpClient, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+			require.True(t, ok)
+			require.Nil(t, httpClient.lastReq)
 		})
 	}
 }
@@ -351,7 +355,9 @@ func TestAstraHTTPBridge_AcknowledgedUsageDoesNotReplayBeforeFirstHeartbeat(t *t
 	require.Equal(t, 5, result.Usage.InputTokens)
 	require.Equal(t, 2, result.Usage.OutputTokens)
 	require.Equal(t, 1, dialer.DialCount())
-	require.Nil(t, svc.httpUpstream.(*httpUpstreamRecorder).lastReq)
+	httpClient, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+	require.True(t, ok)
+	require.Nil(t, httpClient.lastReq)
 	require.NotContains(t, rec.Body.String(), ": ping")
 	require.Nil(t, result.FirstTokenMs)
 	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
