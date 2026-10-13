@@ -1260,7 +1260,7 @@ const DefaultOpenAIWSClientFirstMessageTimeoutSeconds = 30
 // 注意：默认全局开启；如需回滚可使用 force_http 或关闭 enabled。
 type GatewayOpenAIWSConfig struct {
 	// CtxPoolHTTPBridgeEnabled automatically bridges full-input HTTP Responses
-	// for OAuth accounts in ctx_pool mode, independently of the legacy canary.
+	// for OAuth accounts in ctx_pool mode; Astra requires its explicit canary gate.
 	CtxPoolHTTPBridgeEnabled bool `mapstructure:"ctx_pool_http_bridge_enabled"`
 	// Checkpoint continuation is experimental and disabled until validated for
 	// the upstream account. It never resumes after client-visible model output.

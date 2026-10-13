@@ -319,6 +319,14 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			return
 		}
 		errorEventSent = true
+		if openAIAstraNativeHTTPAccepted(c) {
+			if err := flushBuffered(); err != nil {
+				clientDisconnected = true
+				return
+			}
+			s.writeOpenAIAstraNativeHTTPFailure(c, resp, originalModel)
+			return
+		}
 		// Responses error events use top-level code/message/param fields. A nested
 		// Chat Completions error envelope loses the classification in strict clients.
 		payload := `{"type":"error","sequence_number":0,"code":` + strconv.Quote(code) + `,"message":` + strconv.Quote(message) + `,"param":null}`
@@ -381,11 +389,19 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			bareErrorAccountSideEffectsPending = false
 		}
 		if codexFailureTerminal && sawBareError && !sawResponseFailed && !clientDisconnected {
-			applyAttemptResponseHeaders()
-			if _, err := writePendingString(buildOpenAIResponseFailedSSE(responseID, originalModel, bareErrorPayload, failedMessage)); err != nil {
-				handlePendingWriteError(err)
+			if openAIAstraNativeHTTPAccepted(c) {
+				flushPending("Client disconnected during Astra terminal flush")
+				if !clientDisconnected {
+					s.writeOpenAIAstraNativeHTTPFailure(c, resp, originalModel)
+					failureDelivered = IsResponseCommitted(c)
+				}
 			} else {
-				failureDelivered = true
+				applyAttemptResponseHeaders()
+				if _, err := writePendingString(buildOpenAIResponseFailedSSE(responseID, originalModel, bareErrorPayload, failedMessage)); err != nil {
+					handlePendingWriteError(err)
+				} else {
+					failureDelivered = true
+				}
 			}
 		}
 		if sawTerminalEvent && !sawFailedEvent {
@@ -409,6 +425,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: missing terminal event")
 		}
 		if sawFailedEvent {
+			if failureDelivered {
+				markOpenAIAstraNativeHTTPFailureDelivered(c)
+			}
 			return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
 		}
 		logOpenAISuccessMissingUsage(ctx, c, account, resp, usage, terminalEventType, clientDisconnected)
@@ -486,6 +505,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if data, ok := extractOpenAISSEDataLine(line); ok {
 			dataBytes := []byte(data)
 			eventType := effectiveOpenAISSEEventType(dataBytes, pendingSSEEventType)
+			observeOpenAIAstraNativeHTTP(c, dataBytes, eventType)
 			if codexFailureTerminal && sawBareError && !sawResponseFailed &&
 				(eventType == "response.completed" || eventType == "response.done") {
 				// A later successful terminal is authoritative over a pending bare
@@ -1716,8 +1736,16 @@ func bodyHasSSEFraming(body []byte) bool {
 
 func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
 	bodyText := string(body)
+	if openAIAstraNativeHTTPStateFromContext(c) != nil {
+		forEachOpenAISSEFrame(bodyText, func(eventType string, payload []byte) {
+			observeOpenAIAstraNativeHTTP(c, payload, eventType)
+		})
+	}
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
 	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
+		if openAIAstraNativeHTTPAccepted(c) {
+			return nil, errors.New("Astra native HTTP response failed after acceptance")
+		}
 		msg := extractOpenAISSEErrorMessage(terminalPayload)
 		if msg == "" {
 			msg = "Upstream compact response failed"
@@ -1730,7 +1758,17 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 		}
 		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 	}
+	if !terminalOK && openAIAstraNativeHTTPAccepted(c) {
+		return nil, errors.New("Astra native HTTP stream ended without a terminal response")
+	}
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
+	if !ok && openAIAstraNativeHTTPStateFromContext(c) != nil && terminalType == "response.incomplete" {
+		// A legitimate incomplete is a terminal response, including for a JSON
+		// client. Keep its actual output/reason/usage instead of returning raw SSE.
+		if response := gjson.GetBytes(terminalPayload, "response"); response.IsObject() {
+			finalResponse, ok = []byte(response.Raw), true
+		}
+	}
 
 	usage := s.parseSSEUsageFromBody(bodyText)
 	if ok {

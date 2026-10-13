@@ -1010,14 +1010,46 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				mappedModelBytes = []byte(mappedModel)
 			}
 		}
+		var pendingJSONDocuments [][]byte
 		for {
-			upstreamMessage, readErr := lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
+			var upstreamMessage []byte
+			var readErr error
+			if len(pendingJSONDocuments) > 0 {
+				upstreamMessage = pendingJSONDocuments[0]
+				pendingJSONDocuments = pendingJSONDocuments[1:]
+			} else {
+				upstreamMessage, readErr = lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
+				if readErr == nil {
+					// Validate the entire transport message before forwarding its
+					// first event. A malformed tail must not leak a valid prefix.
+					if documents, repaired := splitOpenAIConcatenatedJSONDocuments(upstreamMessage); repaired {
+						logOpenAIWSModeInfo(
+							"ingress_ws_concatenated_json_repaired account_id=%d turn=%d conn_id=%s documents=%d bytes=%d",
+							account.ID, turn, truncateOpenAIWSLogValue(lease.ConnID(), openAIWSIDValueMaxLen),
+							len(documents), len(upstreamMessage),
+						)
+						upstreamMessage = documents[0]
+						pendingJSONDocuments = documents[1:]
+					}
+				}
+			}
 			if readErr != nil {
 				lease.MarkBroken()
 				return nil, wrapOpenAIWSIngressTurnError(
 					"read_upstream",
 					fmt.Errorf("read upstream websocket event: %w", readErr),
 					wroteDownstream,
+				)
+			}
+			if !json.Valid(upstreamMessage) {
+				lease.MarkBroken()
+				logOpenAIWSModeInfo(
+					"ingress_ws_invalid_event_json account_id=%d turn=%d conn_id=%s bytes=%d wrote_downstream=%v",
+					account.ID, turn, truncateOpenAIWSLogValue(lease.ConnID(), openAIWSIDValueMaxLen),
+					len(upstreamMessage), wroteDownstream,
+				)
+				return nil, wrapOpenAIWSIngressTurnError(
+					"invalid_event_json", errors.New("upstream websocket returned malformed Responses event JSON"), wroteDownstream,
 				)
 			}
 			if normalized, changed := normalizeCompletedImageGenerationStatus(upstreamMessage); changed {
@@ -1210,6 +1242,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 			if isTerminalEvent {
+				// Preserve this turn's authoritative terminal, but discard any
+				// additional document and retire the ambiguous connection.
+				if len(pendingJSONDocuments) > 0 {
+					logOpenAIWSModeInfo(
+						"ingress_ws_terminal_tail account_id=%d turn=%d conn_id=%s extra_documents=%d",
+						account.ID, turn, truncateOpenAIWSLogValue(lease.ConnID(), openAIWSIDValueMaxLen), len(pendingJSONDocuments),
+					)
+					lease.MarkBroken()
+				}
 				terminalEvent := s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), upstreamMessage)
 				// 客户端已断连时，上游连接的 session 状态不可信，标记 broken 避免回池复用。
 				if clientDisconnected {
