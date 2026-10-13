@@ -117,7 +117,7 @@ func openAICheckpointReasoningIsPrivate(item gjson.Result) bool {
 	}
 	for _, field := range []string{"summary", "content"} {
 		value := item.Get(field)
-		if value.Exists() && value.Type != gjson.Null && !(value.IsArray() && len(value.Array()) == 0) {
+		if value.Exists() && value.Type != gjson.Null && (!value.IsArray() || len(value.Array()) != 0) {
 			return false
 		}
 	}

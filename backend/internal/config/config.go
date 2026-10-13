@@ -3524,7 +3524,7 @@ func (c *Config) Validate() error {
 	}
 	for _, id := range c.Gateway.OpenAIWS.AstraHTTPBridgeAPIKeyIDs {
 		if id <= 0 {
-			return fmt.Errorf("Astra HTTP bridge API key IDs must be positive")
+			return fmt.Errorf("astra HTTP bridge API key IDs must be positive")
 		}
 	}
 	if c.Gateway.OpenAIWS.WriteTimeoutSeconds <= 0 {

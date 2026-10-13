@@ -858,7 +858,7 @@ readLoop:
 				bridgeTerminalEmitted = true
 				return nil, checkpoints.continuation("server_error", errors.New("upstream server_error"))
 			}
-			if !wroteDownstream && canFallback && !(astraHTTPBridge && fallbackReason == "upstream_error_event") {
+			if !wroteDownstream && canFallback && (!astraHTTPBridge || fallbackReason != "upstream_error_event") {
 				return nil, wrapOpenAIWSFallback(fallbackReason, errors.New(errMsg))
 			}
 			statusCode := openAIWSErrorHTTPStatus(message)

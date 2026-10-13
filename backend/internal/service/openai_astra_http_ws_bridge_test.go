@@ -77,7 +77,8 @@ func TestAstraHTTPBridge_GatesRetainHTTP(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, account, c, _, dialer := astraHTTPBridgeFixture(t, &openAIWSCaptureConn{})
 			tc.change(svc, account, c)
-			httpClient := svc.httpUpstream.(*httpUpstreamRecorder)
+			httpClient, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+			require.True(t, ok)
 			httpClient.resp = &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\",\"model\":\"" + tc.model + "\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"))}
 			result, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"`+tc.model+`","stream":true,"input":"hello"}`))
 			require.NoError(t, err)
@@ -99,7 +100,9 @@ func TestAstraHTTPBridge_KeepaliveBeforeTokensCompletesAndBindsOwner(t *testing.
 	require.Nil(t, result.FirstTokenMs, "keepalive comments are not model tokens")
 	require.GreaterOrEqual(t, strings.Count(rec.Body.String(), ": ping\n\n"), 2)
 	require.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"response.completed"`))
-	require.False(t, conn.lastWrite["store"].(bool))
+	store, ok := conn.lastWrite["store"].(bool)
+	require.True(t, ok)
+	require.False(t, store)
 	require.Contains(t, requestToJSONString(conn.lastWrite), "synthetic full input")
 	require.Equal(t, dialer.lastHeaders.Get("session_id"), dialer.lastHeaders.Get("conversation_id"))
 	require.True(t, conn.closed, "request-private upstream must be discarded even on success")
@@ -137,7 +140,9 @@ func TestAstraHTTPBridge_EOFWithOnlyKeepaliveEmitsSSEError(t *testing.T) {
 	})
 	require.True(t, IsResponseCommitted(c), "handler must not append a second terminal failure")
 	require.NotContains(t, rec.Body.String(), `"type":"response.completed"`)
-	require.Nil(t, svc.httpUpstream.(*httpUpstreamRecorder).lastReq, "committed keepalive must not cause an invisible HTTP replay")
+	httpClient, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+	require.True(t, ok)
+	require.Nil(t, httpClient.lastReq, "committed keepalive must not cause an invisible HTTP replay")
 	require.Equal(t, 1, dialer.DialCount())
 }
 
