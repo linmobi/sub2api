@@ -21,6 +21,7 @@ import (
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
 	if c != nil {
 		c.Set(openAIAstraHTTPBridgeContextKey, nil)
+		c.Set(openAIAstraNativeHTTPContextKey, nil)
 	}
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
@@ -126,6 +127,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// Ineligible HTTP requests retain their existing protocol and state handling.
 		wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c))
 	}
+	prepareOpenAIAstraNativeHTTP(c, account, body, wsDecision)
 	passthroughEnabled := account.IsOpenAIPassthroughEnabled()
 	compactPath := isOpenAIResponsesCompactPath(c)
 	if shouldFlattenOpenAIResponsesNamespaces(account, wsDecision.Transport, passthroughEnabled, compactPath) {
@@ -205,7 +207,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// 账号映射未命中时以去除首尾空白的请求模型兜底，计费名与上游模型名一致。
 		return s.forwardResponsesViaNativeAnthropic(ctx, c, account, body, reqModel)
 	case APIProtocolChatCompletions:
-		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
+		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body, startTime)
 	}
 	SetActualOpenAIUpstreamEndpoint(c, openAIResponsesUpstreamEndpoint)
 	if account.IsOpenAI() && (account.IsOpenAIApiKey() || account.IsOpenAIOAuthLike()) {
@@ -1095,17 +1097,33 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// Send request
 		upstreamStart := time.Now()
 		resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
+		if resp != nil {
+			// A2xx returned concurrently with a local header deadline is still
+			// ambiguous generation acceptance; record it before any early exit.
+			markOpenAIAstraNativeHTTPSuccessStatus(c, resp.StatusCode)
+		}
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		if headerGuard != nil && headerGuard.stopHeaderWait() {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
 			headerGuard.close()
-			return nil, s.newOpenAIFirstOutputTimeoutError(
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+				return nil, c.Request.Context().Err()
+			}
+			timeoutErr := s.newOpenAIFirstOutputTimeoutError(
 				ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
 				startTime, originalModel, reasoningEffortValue,
 				firstOutputTimeout, "response_headers", nil,
 			)
+			if openAIAstraNativeHTTPNoReplay(c) {
+				markOpenAIAstraNativeHTTPFailureCause(c, timeoutErr)
+				return s.finishOpenAIAstraNativeHTTPFailure(ctx, c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, extractOpenAIServiceTierFromBody(body), startTime)
+			}
+			return nil, timeoutErr
 		}
 		if err != nil {
 			if resp != nil && resp.Body != nil {
@@ -1113,6 +1131,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			if headerGuard != nil {
 				headerGuard.close()
+			}
+			if openAIAstraNativeHTTPNoReplay(c) {
+				return s.finishOpenAIAstraNativeHTTPFailure(ctx, c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, extractOpenAIServiceTierFromBody(body), startTime)
 			}
 			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
 			// a failover so the handler switches to a healthy account, and temporarily
@@ -1257,6 +1278,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if reqStream {
 			streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue)
 			if err != nil {
+				if openAIAstraNativeHTTPNoReplay(c) {
+					markOpenAIAstraNativeHTTPFailureCause(c, err)
+					return s.finishOpenAIAstraNativeHTTPFailure(ctx, c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+				}
 				if signal, ok := asOpenAICompactFallbackSignal(err); ok {
 					if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 						c, account, requestedModel, body, http.StatusBadRequest, signal.message, signal.payload, compactModelFallbackRetried,
@@ -1304,6 +1329,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		} else {
 			nonStreamResult, err := s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, upstreamModel)
 			if err != nil {
+				if openAIAstraNativeHTTPNoReplay(c) {
+					markOpenAIAstraNativeHTTPFailureCause(c, err)
+					return s.finishOpenAIAstraNativeHTTPFailure(ctx, c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+				}
 				if signal, ok := asOpenAICompactFallbackSignal(err); ok {
 					if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 						c, account, requestedModel, body, http.StatusBadRequest, signal.message, signal.payload, compactModelFallbackRetried,

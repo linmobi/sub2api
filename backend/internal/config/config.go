@@ -1005,6 +1005,8 @@ type GatewayConfig struct {
 	ProxyProbeResponseReadMaxBytes int64 `mapstructure:"proxy_probe_response_read_max_bytes"`
 	// Gemini 上游响应头调试日志开关（默认关闭，避免高频日志开销）
 	GeminiDebugResponseHeaders bool `mapstructure:"gemini_debug_response_headers"`
+	// GeminiCachedContentMaxTTLSeconds: Gemini 显式缓存单次可设置的最长有效期（秒），<=0 时按 86400 处理
+	GeminiCachedContentMaxTTLSeconds int `mapstructure:"gemini_cached_content_max_ttl_seconds"`
 	// ConnectionPoolIsolation: 上游连接池隔离策略（proxy/account/account_proxy）
 	ConnectionPoolIsolation string `mapstructure:"connection_pool_isolation"`
 	// ForceCodexCLI: 强制将 OpenAI `/v1/responses` 请求按 Codex CLI 处理。
@@ -1258,8 +1260,11 @@ const DefaultOpenAIWSClientFirstMessageTimeoutSeconds = 30
 // 注意：默认全局开启；如需回滚可使用 force_http 或关闭 enabled。
 type GatewayOpenAIWSConfig struct {
 	// CtxPoolHTTPBridgeEnabled automatically bridges full-input HTTP Responses
-	// for OAuth accounts in ctx_pool mode, independently of the legacy canary.
+	// for OAuth accounts in ctx_pool mode; Astra requires its explicit canary gate.
 	CtxPoolHTTPBridgeEnabled bool `mapstructure:"ctx_pool_http_bridge_enabled"`
+	// Checkpoint continuation is experimental and disabled until validated for
+	// the upstream account. It never resumes after client-visible model output.
+	CtxPoolCheckpointRecoveryEnabled bool `mapstructure:"ctx_pool_checkpoint_recovery_enabled"`
 	// AstraHTTPBridgeEnabled is an experimental, default-off Responses HTTP/SSE
 	// to WSv2 bridge. It also requires an explicit OAuth account opt-in.
 	AstraHTTPBridgeEnabled bool `mapstructure:"astra_http_bridge_enabled"`
@@ -2102,6 +2107,7 @@ func setDefaults() {
 		"api.openai.com",
 		"api.anthropic.com",
 		"api.kimi.com",
+		"api.kimi.ai",
 		"api.moonshot.ai",
 		"api.moonshot.cn",
 		"open.bigmodel.cn",
@@ -2450,6 +2456,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_ws.enabled", true)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_enabled", false)
 	viper.SetDefault("gateway.openai_ws.ctx_pool_http_bridge_enabled", true)
+	viper.SetDefault("gateway.openai_ws.ctx_pool_checkpoint_recovery_enabled", false)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_api_key_ids", []int64{})
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_read_timeout_seconds", 3600)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_heartbeat_seconds", 15)
@@ -2544,6 +2551,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.models_list_read_max_bytes", DefaultModelsListReadMaxBytes)
 	viper.SetDefault("gateway.proxy_probe_response_read_max_bytes", int64(1024*1024))
 	viper.SetDefault("gateway.gemini_debug_response_headers", false)
+	viper.SetDefault("gateway.gemini_cached_content_max_ttl_seconds", 86400)
 	viper.SetDefault("gateway.connection_pool_isolation", ConnectionPoolIsolationAccountProxy)
 	// HTTP 上游连接池配置（针对 5000+ 并发用户优化）
 	viper.SetDefault("gateway.max_idle_conns", 2560)          // 最大空闲连接总数（高并发场景可调大）
@@ -3516,7 +3524,7 @@ func (c *Config) Validate() error {
 	}
 	for _, id := range c.Gateway.OpenAIWS.AstraHTTPBridgeAPIKeyIDs {
 		if id <= 0 {
-			return fmt.Errorf("Astra HTTP bridge API key IDs must be positive")
+			return fmt.Errorf("astra HTTP bridge API key IDs must be positive")
 		}
 	}
 	if c.Gateway.OpenAIWS.WriteTimeoutSeconds <= 0 {

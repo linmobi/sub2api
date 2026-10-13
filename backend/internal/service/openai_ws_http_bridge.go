@@ -14,8 +14,10 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
 )
 
 const (
@@ -25,6 +27,137 @@ const (
 )
 
 const openAIWSHTTPBridgeToolStateContextKey = "openai_ws_http_bridge_tool_state"
+
+var (
+	errOpenAIWSHTTPBridgeInvalidSSEFrame = errors.New("invalid upstream HTTP bridge SSE frame")
+	errOpenAIWSHTTPBridgeSSEFrameLimit   = errors.New("upstream HTTP bridge SSE frame limit exceeded")
+)
+
+func openAIWSHTTPBridgeReadErrorKind(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, io.EOF):
+		return "eof"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case errors.Is(err, bufio.ErrTooLong):
+		return "scan_limit"
+	case errors.Is(err, errOpenAIWSHTTPBridgeInvalidSSEFrame):
+		return "invalid_frame"
+	case errors.Is(err, errOpenAIWSHTTPBridgeSSEFrameLimit):
+		return "frame_limit"
+	default:
+		return "read_error"
+	}
+}
+
+type openAIWSHTTPBridgeFailureMetadata struct {
+	accountID                                                                        int64
+	turn, status, events, tokenEvents, terminalEvents                                int
+	failureKind, readErrorKind                                                       string
+	upstreamSuccessStatus, accepted, wroteDownstream, clientDisconnected, usageKnown bool
+}
+
+func logOpenAIWSHTTPBridgeFailure(m openAIWSHTTPBridgeFailureMetadata) {
+	logger.L().Warn("openai.ws_http_bridge_failed",
+		zap.String("upstream_transport", "http_sse"), zap.Int64("account_id", m.accountID), zap.Int("turn", m.turn),
+		zap.Int("upstream_status", m.status), zap.Bool("upstream_success_status", m.upstreamSuccessStatus),
+		zap.String("failure_kind", m.failureKind), zap.String("read_error_kind", m.readErrorKind),
+		zap.Int("events", m.events), zap.Int("token_events", m.tokenEvents), zap.Int("terminal_events", m.terminalEvents),
+		zap.Bool("accepted", m.accepted), zap.Bool("wrote_downstream", m.wroteDownstream),
+		zap.Bool("client_disconnected", m.clientDisconnected), zap.Bool("usage_known", m.usageKnown))
+}
+
+// Assemble a complete SSE frame before interpreting any JSON document. A
+// physical data line may contain only part of a JSON object, and a corrupt
+// concatenated frame must be validated in full before exposing its first tool
+// argument fragment. Only the current bounded frame is retained in memory.
+type openAIWSHTTPBridgeEventScanner struct {
+	scanner    *bufio.Scanner
+	parser     openAICompatSSEFrameParser
+	maxBytes   int
+	frameBytes int
+	pending    [][]byte
+	current    []byte
+	err        error
+	finished   bool
+}
+
+func (s *openAIWSHTTPBridgeEventScanner) queueFrame(frame openAICompatSSEFrame, present bool) bool {
+	if !present {
+		return true
+	}
+	s.frameBytes = 0
+	payload := []byte(strings.TrimSpace(frame.Data))
+	if len(payload) == 0 {
+		return true
+	}
+	if string(payload) == "[DONE]" {
+		s.pending = append(s.pending, payload)
+		return true
+	}
+	documents, split := splitOpenAIConcatenatedJSONDocuments(payload)
+	if !split {
+		if !json.Valid(payload) || !gjson.ParseBytes(payload).IsObject() {
+			s.err = errOpenAIWSHTTPBridgeInvalidSSEFrame
+			return false
+		}
+		documents = [][]byte{payload}
+	}
+	// Validate every document before queuing any part of this frame. Preserve
+	// the original raw JSON when its event type is already present.
+	for i, document := range documents {
+		document = []byte(openAICompatPayloadWithEventType(string(document), frame.EventType))
+		eventType := gjson.GetBytes(document, "type")
+		if eventType.Type != gjson.String || strings.TrimSpace(eventType.String()) == "" || strings.ContainsAny(eventType.String(), "\r\n") {
+			s.err = errOpenAIWSHTTPBridgeInvalidSSEFrame
+			return false
+		}
+		documents[i] = document
+	}
+	s.pending = documents
+	return true
+}
+
+func (s *openAIWSHTTPBridgeEventScanner) Scan() bool {
+	for len(s.pending) == 0 && s.err == nil && !s.finished {
+		if !s.scanner.Scan() {
+			s.finished = true
+			if scanErr := s.scanner.Err(); scanErr != nil {
+				s.err = scanErr
+				break
+			}
+			// Retain the existing compatibility behavior for a complete JSON
+			// frame followed by clean EOF without a trailing blank line.
+			s.queueFrame(s.parser.Finish())
+			break
+		}
+		line := s.scanner.Text()
+		if data, present := extractOpenAISSEDataLine(line); present {
+			s.frameBytes += len(data) + 1
+			if s.frameBytes > s.maxBytes {
+				s.err = errOpenAIWSHTTPBridgeSSEFrameLimit
+				break
+			}
+		}
+		if !s.queueFrame(s.parser.AddLine(line)) {
+			break
+		}
+	}
+	if len(s.pending) == 0 {
+		return false
+	}
+	s.current = s.pending[0]
+	s.pending = s.pending[1:]
+	return true
+}
+
+func (s *openAIWSHTTPBridgeEventScanner) Err() error { return s.err }
 
 type openAIWSHTTPBridgeToolState struct {
 	ClientMapping apicompat.ResponsesClientToolMapping
@@ -542,6 +675,10 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	}
 
 	turnStart := time.Now()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	logger.L().Info("openai.ws_http_bridge_enter", zap.String("upstream_transport", "http_sse"), zap.Int64("account_id", account.ID), zap.Int("turn", turn), zap.Int("payload_bytes", payloadBytes))
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
 	var resp *http.Response
 	for {
@@ -551,6 +688,10 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		resp, err = s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			logOpenAIWSHTTPBridgeFailure(openAIWSHTTPBridgeFailureMetadata{accountID: account.ID, turn: turn, failureKind: "http_transport", readErrorKind: openAIWSHTTPBridgeReadErrorKind(err)})
 			if turn == 1 {
 				return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 			}
@@ -564,6 +705,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		if resp.StatusCode < 400 {
 			break
 		}
+		logOpenAIWSHTTPBridgeFailure(openAIWSHTTPBridgeFailureMetadata{accountID: account.ID, turn: turn, status: resp.StatusCode, failureKind: "http_status", readErrorKind: "none"})
 
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, openAIWSHTTPBridgeErrorBodyLimitBytes))
 		_ = resp.Body.Close()
@@ -639,6 +781,18 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	capacityFailoverSuppressedLogged := false
 	clientDisconnected := false
 	officialOpenAIResponses := account != nil && account.Platform == PlatformOpenAI
+	var astraProtocol *openAIAstraNativeHTTPState
+	// Ingress has already normalized/mapped this payload. Scope the guard to
+	// the model actually sent rather than applying the account mapping twice.
+	if account.IsOpenAIOAuth() && isOpenAIGPT6AstraModel(actualModel) {
+		astraProtocol = &openAIAstraNativeHTTPState{lastSequence: -1}
+	}
+	acceptedAstra := func() bool { return astraProtocol != nil && astraProtocol.accepted }
+	// A success status without a complete SSE frame is ambiguous generation
+	// progress. It is not acceptance evidence, but is not permission to create
+	// another generation either. Explicit rejected HTTP statuses above retain
+	// the normal preacceptance failover behavior.
+	astraSuccessStatus := astraProtocol != nil && resp.StatusCode >= 200 && resp.StatusCode < 300
 	bareErrorPending := false
 	var bareErrorPayload []byte
 	bareErrorMessage := ""
@@ -700,7 +854,75 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	scanner.Buffer(scanBuf[:0], maxLineSize)
 	defer putSSEScannerBuf64K(scanBuf)
 
-	pendingSSEEventType := ""
+	eventScanner := &openAIWSHTTPBridgeEventScanner{scanner: scanner, maxBytes: min(maxLineSize, maxOpenAIConcatenatedJSONBytes)}
+	// A failed native-client bridge attempt stays an error with no success
+	// result. Valid reported usage is diagnostic evidence only; the existing
+	// WS handler decides ledger policy and must not see invented zero usage.
+	failureResult := func() *OpenAIForwardResult {
+		if astraProtocol != nil {
+			return nil
+		}
+		return resultWithUsage()
+	}
+	writeAstraFailure := func(source []byte) error {
+		if astraProtocol == nil || astraProtocol.failureDelivered || clientDisconnected || ctx.Err() != nil {
+			return nil
+		}
+		if len(astraProtocol.errorPayload) > 0 {
+			source = astraProtocol.errorPayload
+		}
+		terminal := buildOpenAIAstraHTTPProtocolFailure(astraProtocol, astraProtocol.responseID, originalModel, source)
+		if rewritten, changed := sanitizeOpenAICapacityShedErrorCodeForClient(terminal); changed {
+			terminal = rewritten
+		}
+		messages := append(pendingClientMessages, terminal)
+		pendingClientMessages = nil
+		pendingClientMessageBytes = 0
+		for _, message := range messages {
+			if err := writeClientMessage(message); err != nil {
+				if ctx.Err() != nil || isOpenAIWSClientDisconnectError(err) {
+					clientDisconnected = true
+					return nil
+				}
+				return errors.New("write Astra websocket HTTP bridge failure terminal")
+			}
+			wroteDownstream = true
+		}
+		astraProtocol.failureDelivered = true
+		markOpenAIWSClientVisibleFailure(c, gjson.GetBytes(terminal, "type").String(), terminal)
+		return nil
+	}
+	finishAstraFailure := func(kind string, source []byte, cause error) (*OpenAIForwardResult, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if bareErrorPending && !failureAccountSideEffectsApplied {
+			failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, mappedModel, resp.Header, bareErrorPayload)
+		}
+		upstreamTerminalEvent = "response.failed"
+		if err := writeAstraFailure(source); err != nil {
+			cause = err
+		}
+		status := http.StatusBadGateway
+		if len(astraProtocol.errorPayload) > 0 {
+			status = openAIWSErrorHTTPStatus(astraProtocol.errorPayload)
+		}
+		if _, sequenceAvailable := openAIWSResponseSequenceSuccessor(astraProtocol.lastSequence, 0); astraProtocol.sequenceInvalid || !sequenceAvailable {
+			status = http.StatusBadGateway
+		}
+		readKind := "none"
+		switch kind {
+		case "stream_read":
+			readKind = openAIWSHTTPBridgeReadErrorKind(cause)
+		case "missing_terminal":
+			readKind = "eof"
+		}
+		logOpenAIWSHTTPBridgeFailure(openAIWSHTTPBridgeFailureMetadata{accountID: account.ID, turn: turn, status: status, upstreamSuccessStatus: astraSuccessStatus,
+			failureKind: kind, readErrorKind: readKind, events: eventCount, tokenEvents: tokenEventCount, terminalEvents: terminalEventCount,
+			accepted: astraProtocol.accepted, wroteDownstream: wroteDownstream, clientDisconnected: clientDisconnected, usageKnown: astraProtocol.usageKnown})
+		// Never wrap a failover cause once this generation has been accepted.
+		return nil, fmt.Errorf("astra upstream HTTP bridge generation failed: %s", kind)
+	}
 	finalizeBareError := func() error {
 		if !bareErrorPending {
 			return nil
@@ -709,6 +931,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, mappedModel, resp.Header, bareErrorPayload)
 		}
 		upstreamTerminalEvent = "response.failed"
+		if astraProtocol != nil {
+			return writeAstraFailure(bareErrorPayload)
+		}
 		if clientDisconnected {
 			return nil
 		}
@@ -732,34 +957,19 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		markOpenAIWSClientVisibleFailure(c, "response.failed", clientMessage)
 		return nil
 	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if eventType, ok := extractOpenAISSEEventLine(line); ok {
-			pendingSSEEventType = eventType
-			continue
-		}
-		if strings.TrimSpace(line) == "" {
-			pendingSSEEventType = ""
-			continue
-		}
-		data, ok := extractOpenAISSEDataLine(line)
-		if !ok {
-			continue
-		}
-		trimmedData := strings.TrimSpace(data)
-		if trimmedData == "" {
-			continue
-		}
+	for eventScanner.Scan() {
+		trimmedData := string(eventScanner.current)
 		if trimmedData == "[DONE]" {
 			sawDone = true
 			continue
 		}
 
-		upstreamMessage := []byte(openAICompatPayloadWithEventType(trimmedData, pendingSSEEventType))
+		upstreamMessage := eventScanner.current
 		if normalized, changed := normalizeCompletedImageGenerationStatus(upstreamMessage); changed {
 			upstreamMessage = normalized
 		}
 		eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
+		observeOpenAIAstraHTTPProtocol(astraProtocol, upstreamMessage, eventType)
 		responseModelObserver.ObserveOpenAI(upstreamMessage, eventType)
 		if responseID == "" && eventResponseID != "" {
 			responseID = eventResponseID
@@ -771,6 +981,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			}
 			lastEventType = eventType
 		}
+		if astraProtocol != nil && astraProtocol.sequenceInvalid {
+			return finishAstraFailure("invalid_sequence", nil, errors.New("invalid Astra upstream sequence"))
+		}
 		if isOpenAIWSTokenEvent(eventType) {
 			tokenEventCount++
 			if firstTokenMs == nil {
@@ -779,7 +992,11 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			}
 		}
 		if openAIWSMessageShouldParseUsage(eventType, upstreamMessage) {
-			parseOpenAIWSResponseUsageFromCompletedEvent(upstreamMessage, &usage)
+			if astraProtocol != nil {
+				usage = astraProtocol.usage
+			} else {
+				parseOpenAIWSResponseUsageFromCompletedEvent(upstreamMessage, &usage)
+			}
 		}
 		if eventType == "error" || eventType == "response.failed" {
 			markOpenAICyberPolicyEvent(c, upstreamMessage, http.StatusOK, &usage)
@@ -797,7 +1014,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		replayCollector.AddEvent(eventType, upstreamMessage)
 
 		var upstreamEventErr error
-		if officialOpenAIResponses && bareErrorPending && (eventType == "response.completed" || eventType == "response.done") {
+		if officialOpenAIResponses && bareErrorPending && (eventType == "response.completed" || eventType == "response.done" || (astraProtocol != nil && eventType == "response.incomplete")) {
 			// Some upstreams emit a recoverable bare error before the authoritative
 			// successful terminal. Do not replace that terminal with a synthetic
 			// failure or retain side effects from the superseded error.
@@ -840,7 +1057,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			}
 			// A disconnected client needs this attempt drained for usage, not replayed,
 			// even when only non-semantic heartbeats were delivered.
-			if !clientDisconnected && !wroteDownstream && shouldFailover && (turn == 1 || statusCode == http.StatusTooManyRequests) {
+			if !clientDisconnected && !wroteDownstream && !astraSuccessStatus && !acceptedAstra() && shouldFailover && (turn == 1 || statusCode == http.StatusTooManyRequests) {
 				if account.Platform == PlatformGrok {
 					return nil, newOpenAIUpstreamFailoverError(statusCode, resp.Header, upstreamMessage, errMessage, false)
 				}
@@ -885,6 +1102,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				isOpenAIWSTerminalEvent(eventType)
 			if stageBeforeSemanticOutput && !commitStagedMessages && !isKeepalive {
 				if pendingClientMessageBytes+int64(len(clientMessage)) > openAIFirstOutputStageMaxBytes {
+					if acceptedAstra() || astraSuccessStatus {
+						return finishAstraFailure("staging_limit", nil, errors.New("astra HTTP bridge staging limit exceeded"))
+					}
 					return nil, s.newOpenAIStreamFailoverError(
 						c,
 						account,
@@ -921,6 +1141,12 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 							)
 							break
 						}
+						if astraProtocol != nil {
+							if ctx.Err() != nil {
+								return nil, ctx.Err()
+							}
+							return nil, errors.New("write Astra client websocket event")
+						}
 						return nil, wrapOpenAIWSIngressTurnError(
 							"write_client",
 							fmt.Errorf("write client websocket event: %w", err),
@@ -935,10 +1161,13 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		if !clientDisconnected && !suppressClientMessage {
 			markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
+			if astraProtocol != nil && eventType == "response.failed" {
+				astraProtocol.failureDelivered = true
+			}
 		}
 
 		if upstreamEventErr != nil {
-			return resultWithUsage(), upstreamEventErr
+			return failureResult(), upstreamEventErr
 		}
 		if isOpenAIWSTerminalEvent(eventType) && !bareErrorPending {
 			if eventType == "response.failed" {
@@ -952,7 +1181,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				firstTokenMsValue = *firstTokenMs
 			}
 			logOpenAIWSModeInfo(
-				"ingress_ws_http_bridge_turn_completed account_id=%d turn=%d response_id=%s payload_bytes=%d duration_ms=%d events=%d token_events=%d terminal_events=%d first_event=%s last_event=%s first_token_ms=%d client_disconnected=%v",
+				"ingress_ws_http_bridge_turn_completed upstream_transport=http_sse account_id=%d turn=%d response_id=%s payload_bytes=%d duration_ms=%d events=%d token_events=%d terminal_events=%d first_event=%s last_event=%s first_token_ms=%d client_disconnected=%v",
 				account.ID,
 				turn,
 				truncateOpenAIWSLogValue(responseID, openAIWSIDValueMaxLen),
@@ -966,22 +1195,41 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				firstTokenMsValue,
 				clientDisconnected,
 			)
+			if astraProtocol != nil && eventType == "response.failed" {
+				return finishAstraFailure("semantic_error", upstreamMessage, errors.New("astra upstream HTTP bridge response.failed"))
+			}
+			if astraProtocol != nil {
+				logger.L().Info("openai.ws_http_bridge_completed", zap.String("upstream_transport", "http_sse"), zap.Int64("account_id", account.ID), zap.Int("turn", turn),
+					zap.Int("upstream_status", resp.StatusCode), zap.Bool("upstream_success_status", astraSuccessStatus),
+					zap.Int("events", eventCount), zap.Int("token_events", tokenEventCount), zap.Int("terminal_events", terminalEventCount),
+					zap.Bool("accepted", astraProtocol.accepted), zap.Bool("wrote_downstream", wroteDownstream),
+					zap.Bool("client_disconnected", clientDisconnected), zap.Bool("usage_known", astraProtocol.usageKnown))
+			}
 			return resultWithUsage(), nil
 		}
 	}
 	if bareErrorPending {
+		if astraProtocol != nil {
+			return finishAstraFailure("semantic_error", bareErrorPayload, errors.New(bareErrorMessage))
+		}
 		if finalizeErr := finalizeBareError(); finalizeErr != nil {
 			return resultWithUsage(), finalizeErr
 		}
-		if scanErr := scanner.Err(); scanErr != nil {
+		if scanErr := eventScanner.Err(); scanErr != nil {
 			return resultWithUsage(), fmt.Errorf("read upstream http bridge stream after error event: %w", scanErr)
 		}
 		return resultWithUsage(), errors.New(bareErrorMessage)
 	}
-	if err := scanner.Err(); err != nil {
+	if ctx.Err() != nil {
+		return failureResult(), ctx.Err()
+	}
+	if err := eventScanner.Err(); err != nil {
 		streamErr := fmt.Errorf("read upstream http bridge stream: %w", err)
-		if turn == 1 && !clientDisconnected && !wroteDownstream {
+		if turn == 1 && !clientDisconnected && !wroteDownstream && !astraSuccessStatus && !acceptedAstra() {
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, streamErr, true)
+		}
+		if astraProtocol != nil {
+			return finishAstraFailure("stream_read", nil, err)
 		}
 		return resultWithUsage(), streamErr
 	}
@@ -989,8 +1237,11 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	if sawDone {
 		terminalErr = errors.New("upstream http bridge stream sent [DONE] before terminal event")
 	}
-	if turn == 1 && !clientDisconnected && !wroteDownstream {
+	if turn == 1 && !clientDisconnected && !wroteDownstream && !astraSuccessStatus && !acceptedAstra() {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, terminalErr, true)
+	}
+	if astraProtocol != nil {
+		return finishAstraFailure("missing_terminal", nil, terminalErr)
 	}
 	return resultWithUsage(), terminalErr
 }
