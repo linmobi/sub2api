@@ -1744,7 +1744,7 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
 	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
 		if openAIAstraNativeHTTPAccepted(c) {
-			return nil, errors.New("Astra native HTTP response failed after acceptance")
+			return nil, errors.New("astra native HTTP response failed after acceptance")
 		}
 		msg := extractOpenAISSEErrorMessage(terminalPayload)
 		if msg == "" {
@@ -1759,7 +1759,7 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 	}
 	if !terminalOK && openAIAstraNativeHTTPAccepted(c) {
-		return nil, errors.New("Astra native HTTP stream ended without a terminal response")
+		return nil, errors.New("astra native HTTP stream ended without a terminal response")
 	}
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
 	if !ok && openAIAstraNativeHTTPStateFromContext(c) != nil && terminalType == "response.incomplete" {

@@ -68,7 +68,7 @@ func newOpenAIWSIngressDocumentFixture(t *testing.T, frames ...string) *openAIWS
 			fixture.serverErr <- err
 			return
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
 		c.Request = r
 		readCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)

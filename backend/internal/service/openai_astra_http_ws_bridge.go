@@ -245,7 +245,7 @@ func (s *OpenAIGatewayService) finishOpenAIAstraNativeHTTPFailure(ctx context.Co
 	state := openAIAstraNativeHTTPStateFromContext(c)
 	// Do not retain a failover cause: errors.As follows wrapped causes, which
 	// would let the outer account loop replay this accepted generation.
-	err := errors.New("Astra native HTTP generation failed after acceptance")
+	err := errors.New("astra native HTTP generation failed after acceptance")
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	} else {
