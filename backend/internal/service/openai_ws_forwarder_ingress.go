@@ -6,17 +6,92 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"go.uber.org/zap"
 )
+
+// Keep upstream closure metadata separate from client-closure causes. Exposing
+// an upstream CloseError(1000) through Unwrap would make the handler classify an
+// interrupted generation as a normal client exit; its reason can also contain
+// provider-controlled text that must not enter request logs.
+type openAIWSIngressReadFailure struct {
+	kind        string
+	closeStatus int
+	cause       error
+}
+
+func (e *openAIWSIngressReadFailure) Error() string {
+	return "read upstream websocket event: " + e.kind
+}
+
+func (e *openAIWSIngressReadFailure) Unwrap() error { return e.cause }
+
+func newOpenAIWSIngressReadFailure(err error) *openAIWSIngressReadFailure {
+	failure := &openAIWSIngressReadFailure{kind: "read_failure", closeStatus: int(coderws.CloseStatus(err))}
+	switch {
+	case errors.Is(err, context.Canceled):
+		failure.kind, failure.cause = "context_canceled", context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		failure.kind, failure.cause = "read_deadline", context.DeadlineExceeded
+	case failure.closeStatus != -1:
+		failure.kind = "websocket_close"
+	case errors.Is(err, io.EOF):
+		failure.kind, failure.cause = "eof", io.EOF
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		failure.kind, failure.cause = "unexpected_eof", io.ErrUnexpectedEOF
+	case errors.Is(err, net.ErrClosed):
+		failure.kind, failure.cause = "network_closed", net.ErrClosed
+	default:
+		var networkErr net.Error
+		if errors.As(err, &networkErr) && networkErr.Timeout() {
+			failure.kind = "network_timeout"
+		}
+	}
+	return failure
+}
+
+func openAIWSIngressReadEvidenceEventType(eventType string) string {
+	switch eventType {
+	case "error", "response.created", "response.in_progress", "response.queued",
+		"response.completed", "response.done", "response.failed", "response.incomplete", "response.canceled", "response.cancelled",
+		"response.output_item.added", "response.output_item.done", "response.content_part.added", "response.content_part.done",
+		"response.output_text.delta", "response.output_text.done", "response.refusal.delta", "response.refusal.done",
+		"response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+		"response.reasoning_text.delta", "response.reasoning_text.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		return eventType
+	case "":
+		return "none"
+	default:
+		return "other"
+	}
+}
+
+func openAIWSIngressReadEvidenceResponseID(responseID string) string {
+	if !strings.HasPrefix(responseID, "resp_") || len(responseID) > 128 {
+		return ""
+	}
+	for _, ch := range responseID {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
+			continue
+		}
+		return ""
+	}
+	return responseID
+}
 
 type openAIWSRejectedFieldRetryError struct {
 	body   []byte
@@ -993,6 +1068,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		eventCount := 0
 		tokenEventCount := 0
 		terminalEventCount := 0
+		accepted := false
+		clientFailureDelivered := false
+		lastSequenceNumber := int64(-1)
 		replayCollector := &openAIWSToolCallReplayCollector{}
 		firstEventType := ""
 		lastEventType := ""
@@ -1034,11 +1112,55 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 			if readErr != nil {
+				failure := newOpenAIWSIngressReadFailure(readErr)
+				clientContextCanceled := hooks != nil && hooks.ClientLifecycleContext != nil && hooks.ClientLifecycleContext.Err() != nil
+				sessionPreempted := isOpenAIWSSessionPreempted(ctx)
+				clientGone := clientDisconnected || ctx.Err() != nil || clientContextCanceled || sessionPreempted
+				priorFailureDelivered := clientFailureDelivered
 				lease.MarkBroken()
+				if (accepted || wroteDownstream) && !clientGone && !priorFailureDelivered && terminalEventCount == 0 {
+					// A transport close is not a successful Responses terminal. End
+					// this accepted turn explicitly without replay or invented usage.
+					failedEvent := buildOpenAIWSResponseSequenceErrorEvent()
+					failureEventType := "error"
+					if next, valid := openAIWSResponseSequenceSuccessor(lastSequenceNumber, eventCount); valid {
+						// Preserve int64 exactly without narrowing the shared builder's
+						// existing int API on platforms with a smaller native int.
+						if event, err := sjson.SetBytes(buildAstraHTTPBridgeFailedEvent(responseID, originalModel, nil, 0), "sequence_number", next); err == nil {
+							failedEvent, failureEventType = event, "response.failed"
+						}
+					}
+					if writeErr := writeClientMessage(failedEvent); writeErr == nil {
+						wroteDownstream = true
+						clientFailureDelivered = true
+						markOpenAIWSClientVisibleFailure(c, failureEventType, failedEvent)
+					}
+				}
+				fields := []zap.Field{
+					zap.String("stage", "read_upstream"), zap.Int64("account_id", account.ID), zap.Int("turn", turn),
+					zap.String("conn_id", lease.ConnID()), zap.String("read_error_kind", failure.kind), zap.Int("close_status", failure.closeStatus),
+					zap.Bool("context_canceled", errors.Is(ctx.Err(), context.Canceled)), zap.Bool("context_deadline", errors.Is(ctx.Err(), context.DeadlineExceeded)),
+					zap.Bool("ingress_lease_lost", errors.Is(context.Cause(ctx), ErrOpenAIWSIngressLeaseLost)),
+					zap.Bool("read_context_canceled", errors.Is(readErr, context.Canceled)), zap.Bool("client_context_canceled", clientContextCanceled),
+					zap.Bool("client_disconnected", clientDisconnected), zap.Bool("session_preempted", sessionPreempted),
+					zap.Bool("accepted", accepted), zap.Bool("wrote_downstream", wroteDownstream), zap.Bool("failure_delivered", clientFailureDelivered),
+					zap.Bool("prior_failure_delivered", priorFailureDelivered),
+					zap.Int("events", eventCount), zap.Int("token_events", tokenEventCount), zap.Int("terminal_events", terminalEventCount),
+					zap.String("last_event", openAIWSIngressReadEvidenceEventType(lastEventType)),
+					zap.String("response_id", openAIWSIngressReadEvidenceResponseID(responseID)), zap.Int64("duration_ms", time.Since(turnStart).Milliseconds()),
+				}
+				if clientGone || priorFailureDelivered {
+					logger.L().Info("openai.ws_ingress_read_failed", fields...)
+				} else {
+					logger.L().Warn("openai.ws_ingress_read_failed", fields...)
+				}
+				if sessionPreempted {
+					return nil, errOpenAIWSSessionPreempted
+				}
 				return nil, wrapOpenAIWSIngressTurnError(
 					"read_upstream",
-					fmt.Errorf("read upstream websocket event: %w", readErr),
-					wroteDownstream,
+					failure,
+					wroteDownstream || accepted,
 				)
 			}
 			if !json.Valid(upstreamMessage) {
@@ -1057,6 +1179,46 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 
 			eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
+			if strings.HasPrefix(eventType, "response.") || eventType == "error" {
+				if sequence := gjson.GetBytes(upstreamMessage, "sequence_number"); sequence.Exists() {
+					value, valid := parseOpenAIWSResponseSequence(sequence)
+					if !valid {
+						// Do not forward or observe an invalid provider sequence. The
+						// generic error has no sequence, usage or provider-controlled text.
+						lease.MarkBroken()
+						sessionPreempted := isOpenAIWSSessionPreempted(ctx)
+						clientContextCanceled := hooks != nil && hooks.ClientLifecycleContext != nil && hooks.ClientLifecycleContext.Err() != nil
+						clientGone := clientDisconnected || ctx.Err() != nil || clientContextCanceled || sessionPreempted
+						if !clientGone && !clientFailureDelivered {
+							protocolError := buildOpenAIWSResponseSequenceErrorEvent()
+							if writeErr := writeClientMessage(protocolError); writeErr == nil {
+								wroteDownstream, clientFailureDelivered = true, true
+								markOpenAIWSClientVisibleFailure(c, "error", protocolError)
+							}
+						}
+						fields := []zap.Field{
+							zap.String("stage", "invalid_event_sequence"), zap.Int64("account_id", account.ID), zap.Int("turn", turn),
+							zap.String("event", openAIWSIngressReadEvidenceEventType(eventType)), zap.Bool("accepted", accepted),
+							zap.Bool("failure_delivered", clientFailureDelivered), zap.Bool("client_gone", clientGone), zap.Bool("session_preempted", sessionPreempted),
+						}
+						if clientGone {
+							logger.L().Info("openai.ws_ingress_invalid_sequence", fields...)
+						} else {
+							logger.L().Warn("openai.ws_ingress_invalid_sequence", fields...)
+						}
+						if sessionPreempted {
+							return nil, errOpenAIWSSessionPreempted
+						}
+						return nil, wrapOpenAIWSIngressTurnError("invalid_event_sequence", errors.New("upstream websocket returned invalid Responses event sequence"), wroteDownstream || accepted)
+					}
+					if value > lastSequenceNumber {
+						lastSequenceNumber = value
+					}
+				}
+			}
+			if strings.HasPrefix(eventType, "response.") {
+				accepted = true
+			}
 			responseModelObserver.ObserveOpenAI(upstreamMessage, eventType)
 			if responseID == "" && eventResponseID != "" {
 				responseID = eventResponseID
@@ -1238,6 +1400,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					}
 				} else {
 					wroteDownstream = true
+					if eventType == "error" || eventType == "response.failed" {
+						clientFailureDelivered = true
+					}
 					markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
 				}
 			}

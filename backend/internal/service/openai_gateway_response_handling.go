@@ -319,7 +319,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			return
 		}
 		errorEventSent = true
-		if openAIAstraNativeHTTPAccepted(c) {
+		if openAIAstraNativeHTTPNoReplay(c) {
 			if err := flushBuffered(); err != nil {
 				clientDisconnected = true
 				return
@@ -389,7 +389,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			bareErrorAccountSideEffectsPending = false
 		}
 		if codexFailureTerminal && sawBareError && !sawResponseFailed && !clientDisconnected {
-			if openAIAstraNativeHTTPAccepted(c) {
+			if openAIAstraNativeHTTPNoReplay(c) {
 				flushPending("Client disconnected during Astra terminal flush")
 				if !clientDisconnected {
 					s.writeOpenAIAstraNativeHTTPFailure(c, resp, originalModel)
@@ -506,6 +506,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			dataBytes := []byte(data)
 			eventType := effectiveOpenAISSEEventType(dataBytes, pendingSSEEventType)
 			observeOpenAIAstraNativeHTTP(c, dataBytes, eventType)
+			if state := openAIAstraNativeHTTPStateFromContext(c); state != nil && state.sequenceInvalid {
+				streamEarlyErr = errors.New("invalid Astra upstream sequence")
+				return
+			}
 			if codexFailureTerminal && sawBareError && !sawResponseFailed &&
 				(eventType == "response.completed" || eventType == "response.done") {
 				// A later successful terminal is authoritative over a pending bare
@@ -1741,9 +1745,12 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 			observeOpenAIAstraNativeHTTP(c, payload, eventType)
 		})
 	}
+	if state := openAIAstraNativeHTTPStateFromContext(c); state != nil && state.sequenceInvalid {
+		return nil, errors.New("invalid Astra upstream sequence")
+	}
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
 	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
-		if openAIAstraNativeHTTPAccepted(c) {
+		if openAIAstraNativeHTTPNoReplay(c) {
 			return nil, errors.New("astra native HTTP response failed after acceptance")
 		}
 		msg := extractOpenAISSEErrorMessage(terminalPayload)
@@ -1758,7 +1765,7 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 		}
 		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 	}
-	if !terminalOK && openAIAstraNativeHTTPAccepted(c) {
+	if !terminalOK && openAIAstraNativeHTTPNoReplay(c) {
 		return nil, errors.New("astra native HTTP stream ended without a terminal response")
 	}
 	finalResponse, ok := extractCodexFinalResponse(bodyText)

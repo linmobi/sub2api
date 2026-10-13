@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const openAIAstraHTTPBridgeContextKey = "openai_astra_http_ws_bridge"
@@ -67,14 +68,16 @@ const openAIAstraNativeHTTPContextKey = "openai_astra_native_http"
 // answer, tool arguments or encrypted reasoning. Acceptance blocks invisible
 // replay even when an HTTP reader has buffered all events from a nonstream call.
 type openAIAstraNativeHTTPState struct {
-	accepted         bool
-	stream           bool
-	usageKnown       bool
-	usage            OpenAIUsage
-	responseID       string
-	lastSequence     int
-	failureDelivered bool
-	errorPayload     []byte
+	accepted              bool
+	upstreamSuccessStatus bool
+	stream                bool
+	usageKnown            bool
+	usage                 OpenAIUsage
+	responseID            string
+	lastSequence          int64
+	sequenceInvalid       bool
+	failureDelivered      bool
+	errorPayload          []byte
 }
 
 func prepareOpenAIAstraNativeHTTP(c *gin.Context, account *Account, body []byte, decision OpenAIWSProtocolDecision) {
@@ -104,13 +107,52 @@ func openAIAstraNativeHTTPAccepted(c *gin.Context) bool {
 	return state != nil && state.accepted
 }
 
-func observeOpenAIAstraNativeHTTP(c *gin.Context, payload []byte, eventType string) {
+func markOpenAIAstraNativeHTTPSuccessStatus(c *gin.Context, status int) {
+	if state := openAIAstraNativeHTTPStateFromContext(c); state != nil {
+		state.upstreamSuccessStatus = status >= 200 && status < 300
+	}
+}
+
+// A successful HTTP status is not protocol acceptance evidence. However,
+// truncation before a complete SSE frame cannot prove generation never began,
+// so neither that ambiguous case nor accepted progress may replay the input.
+func openAIAstraNativeHTTPNoReplay(c *gin.Context) bool {
 	state := openAIAstraNativeHTTPStateFromContext(c)
+	return state != nil && (state.accepted || state.upstreamSuccessStatus)
+}
+
+func markOpenAIAstraNativeHTTPFailureCause(c *gin.Context, cause error) {
+	state := openAIAstraNativeHTTPStateFromContext(c)
+	if state == nil {
+		return
+	}
+	var timeout *UpstreamFailoverError
+	if errors.As(cause, &timeout) && timeout.StatusCode == http.StatusGatewayTimeout &&
+		gjson.GetBytes(timeout.ResponseBody, "error.type").String() == "first_output_timeout" {
+		// This is a local configured deadline, not evidence of provider EOF.
+		// Retain its type/status without exposing the retry-capable error cause.
+		state.errorPayload = []byte(`{"error":{"code":"first_output_timeout","type":"first_output_timeout","status":504,"message":"Upstream produced no output before the deadline"}}`)
+	}
+}
+
+func observeOpenAIAstraNativeHTTP(c *gin.Context, payload []byte, eventType string) {
+	observeOpenAIAstraHTTPProtocol(openAIAstraNativeHTTPStateFromContext(c), payload, eventType)
+}
+
+// The WS-ingress HTTP bridge has its own per-turn state. Reuse this scalar
+// evidence observer without publishing that state into a shared client session.
+func observeOpenAIAstraHTTPProtocol(state *openAIAstraNativeHTTPState, payload []byte, eventType string) {
 	if state == nil || !gjson.ValidBytes(payload) {
 		return
 	}
-	if sequence := gjson.GetBytes(payload, "sequence_number"); validOpenAIAstraUsageCount(sequence) && uint64(sequence.Int()) < uint64(^uint(0)>>1) {
-		state.lastSequence = max(state.lastSequence, int(sequence.Int()))
+	if sequence := gjson.GetBytes(payload, "sequence_number"); sequence.Exists() && (strings.HasPrefix(eventType, "response.") || eventType == "error") {
+		if value, valid := parseOpenAIWSResponseSequence(sequence); valid {
+			if value > state.lastSequence {
+				state.lastSequence = value
+			}
+		} else {
+			state.sequenceInvalid = true
+		}
 	}
 	id := gjson.GetBytes(payload, "response.id")
 	if id.Type == gjson.String && len(id.String()) <= 256 && strings.TrimSpace(id.String()) != "" {
@@ -200,15 +242,32 @@ func validOpenAIAstraUsageCount(value gjson.Result) bool {
 }
 
 func markOpenAIAstraNativeHTTPFailureDelivered(c *gin.Context) {
-	if state := openAIAstraNativeHTTPStateFromContext(c); state != nil && state.accepted {
+	if state := openAIAstraNativeHTTPStateFromContext(c); state != nil && (state.accepted || state.upstreamSuccessStatus) {
 		state.failureDelivered = true
 		MarkResponseCommitted(c)
 	}
 }
 
+func buildOpenAIAstraHTTPProtocolFailure(state *openAIAstraNativeHTTPState, responseID, model string, source []byte) []byte {
+	if state.sequenceInvalid {
+		return buildOpenAIWSResponseSequenceErrorEvent()
+	}
+	sequence, valid := openAIWSResponseSequenceSuccessor(state.lastSequence, 0)
+	if !valid {
+		return buildOpenAIWSResponseSequenceErrorEvent()
+	}
+	// Keep the existing builder API while encoding the checked int64 sequence
+	// exactly, without a float conversion or architecture-dependent narrowing.
+	payload, err := sjson.SetBytes(buildAstraHTTPBridgeFailedEvent(responseID, model, source, 0), "sequence_number", sequence)
+	if err != nil {
+		return buildOpenAIWSResponseSequenceErrorEvent()
+	}
+	return payload
+}
+
 func (s *OpenAIGatewayService) writeOpenAIAstraNativeHTTPFailure(c *gin.Context, resp *http.Response, model string) {
 	state := openAIAstraNativeHTTPStateFromContext(c)
-	if state == nil || !state.accepted || state.failureDelivered || IsResponseCommitted(c) {
+	if state == nil || !(state.accepted || state.upstreamSuccessStatus) || state.failureDelivered || IsResponseCommitted(c) {
 		return
 	}
 	if c.Request != nil && c.Request.Context().Err() != nil {
@@ -226,10 +285,16 @@ func (s *OpenAIGatewayService) writeOpenAIAstraNativeHTTPFailure(c *gin.Context,
 			message = value
 		}
 	}
+	_, sequenceAvailable := openAIWSResponseSequenceSuccessor(state.lastSequence, 0)
+	if state.sequenceInvalid || !sequenceAvailable {
+		status, code, errType, message = http.StatusBadGateway, "upstream_protocol_error", "upstream_error", "Upstream response sequence is invalid or exhausted"
+	}
 	setOpsUpstreamError(c, status, message, "")
 	if state.stream && c.Writer.Written() {
 		payload, _ := marshalOpenAIUpstreamJSON(gin.H{"error": gin.H{"code": code, "type": errType, "message": message}})
-		_, _ = c.Writer.Write(append(append([]byte("event: response.failed\ndata: "), buildAstraHTTPBridgeFailedEvent(state.responseID, model, payload, state.lastSequence+1)...), '\n', '\n'))
+		failure := buildOpenAIAstraHTTPProtocolFailure(state, state.responseID, model, payload)
+		eventType := gjson.GetBytes(failure, "type").String()
+		_, _ = c.Writer.Write(append(append([]byte("event: "+eventType+"\ndata: "), failure...), '\n', '\n'))
 		c.Writer.Flush()
 		MarkOpsStreamFailure(c, errType, code, message, status)
 	} else {
@@ -246,6 +311,9 @@ func (s *OpenAIGatewayService) finishOpenAIAstraNativeHTTPFailure(ctx context.Co
 	// Do not retain a failover cause: errors.As follows wrapped causes, which
 	// would let the outer account loop replay this accepted generation.
 	err := errors.New("astra native HTTP generation failed after acceptance")
+	if state != nil && gjson.GetBytes(state.errorPayload, "error.type").String() == "first_output_timeout" {
+		err = errors.New("astra native HTTP first-output timeout")
+	}
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	} else {
