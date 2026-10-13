@@ -243,16 +243,7 @@ func markOpenAIWSClientVisibleFailure(c *gin.Context, eventType string, payload 
 		errType = strings.TrimSpace(gjson.GetBytes(payload, prefix+".type").String())
 		message = strings.TrimSpace(gjson.GetBytes(payload, prefix+".message").String())
 	}
-	status := int(gjson.GetBytes(payload, prefix+".status_code").Int())
-	if status == 0 {
-		status = int(gjson.GetBytes(payload, prefix+".status").Int())
-	}
-	if status == 0 && eventType == "error" {
-		status = int(gjson.GetBytes(payload, "status").Int())
-	}
-	if status == 0 {
-		status = openAIWSErrorHTTPStatusFromRaw(code, errType)
-	}
+	status := openAIWSErrorHTTPStatus(payload)
 	if errType == "" {
 		errType = "upstream_error"
 	}
@@ -269,16 +260,7 @@ func openAIWSPayloadTransientStatus(payload []byte) int {
 	if len(payload) == 0 {
 		return 0
 	}
-	status := int(gjson.GetBytes(payload, "response.error.status_code").Int())
-	if status == 0 {
-		status = int(gjson.GetBytes(payload, "response.error.status").Int())
-	}
-	if status == 0 {
-		status = int(gjson.GetBytes(payload, "error.status_code").Int())
-	}
-	if status == 0 {
-		status = int(gjson.GetBytes(payload, "error.status").Int())
-	}
+	status := openAIWSExplicitErrorHTTPStatus(payload)
 	if shouldCooldownOpenAITransientUpstreamError(status, payload) {
 		return status
 	}
@@ -294,7 +276,7 @@ func openAIWSPayloadTransientStatus(payload []byte) int {
 		errType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "error.type").String()))
 	}
 	switch {
-	case code == "server_is_overloaded", code == "slow_down":
+	case code == "server_is_overloaded", code == "slow_down", errType == "service_unavailable_error":
 		return http.StatusServiceUnavailable
 	case strings.Contains(code, "server_error"),
 		strings.Contains(code, "internal_error"),
@@ -798,16 +780,46 @@ func openAIWSErrorHTTPStatusFromRaw(codeRaw, errTypeRaw string) int {
 		return http.StatusForbidden
 	case isOpenAIWSRateLimitError(codeRaw, errTypeRaw, ""):
 		return http.StatusTooManyRequests
+	case code == "server_is_overloaded", code == "slow_down", errType == "service_unavailable_error":
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+// Explicit upstream error statuses take precedence over semantic inference.
+// Reject strings, fractional numbers and success/invalid statuses so an error
+// event cannot accidentally commit a successful HTTP response or poison Ops.
+func openAIWSExplicitErrorHTTPStatus(payload []byte) int {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return 0
+	}
+	for _, value := range gjson.GetManyBytes(payload, openAIStreamErrorStatusPaths...) {
+		if value.Type != gjson.Number {
+			continue
+		}
+		status := value.Int()
+		if status >= 400 && status <= 599 && value.Float() == float64(status) {
+			return int(status)
+		}
+	}
+	return 0
 }
 
 func openAIWSErrorHTTPStatus(message []byte) int {
 	if len(message) == 0 {
 		return http.StatusBadGateway
 	}
+	if status := openAIWSExplicitErrorHTTPStatus(message); status != 0 {
+		return status
+	}
 	codeRaw, errTypeRaw, _ := parseOpenAIWSErrorEventFields(message)
+	if gjson.GetBytes(message, "type").String() == "response.failed" {
+		values := gjson.GetManyBytes(message, "response.error.code", "response.error.type")
+		if strings.TrimSpace(values[0].String()) != "" || strings.TrimSpace(values[1].String()) != "" {
+			codeRaw, errTypeRaw = values[0].String(), values[1].String()
+		}
+	}
 	return openAIWSErrorHTTPStatusFromRaw(codeRaw, errTypeRaw)
 }
 

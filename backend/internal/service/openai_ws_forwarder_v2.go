@@ -15,9 +15,10 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
-func (s *OpenAIGatewayService) forwardOpenAIWSV2(
+func (s *OpenAIGatewayService) forwardOpenAIWSV2Once(
 	ctx context.Context,
 	c *gin.Context,
 	account *Account,
@@ -34,6 +35,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	attempt int,
 	lastFailureReason string,
 	agentTaskRecoveryTried *bool,
+	checkpointRecoveryAllowed bool,
 ) (forwardResult *OpenAIForwardResult, forwardErr error) {
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
@@ -64,6 +66,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	)
 
 	payload := s.buildOpenAIWSCreatePayload(reqBody, account)
+	checkpoints := newOpenAIReasoningCheckpoints(checkpointRecoveryAllowed)
+	if checkpointRecoveryAllowed {
+		includeOpenAIEncryptedReasoning(payload)
+	}
 	if astraHTTPBridge {
 		payload["store"] = false
 		delete(payload, "previous_response_id")
@@ -395,6 +401,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	var firstTokenMs *int
 	responseID := ""
 	var finalResponse []byte
+	var nonstreamDoneItems *openAIWSNonstreamOutputItems
+	if !reqStream {
+		nonstreamDoneItems = newOpenAIWSNonstreamOutputItems(int(openAIWSMessageReadLimitBytes))
+	}
+	canRestoreNonstreamOutput := false
 	wroteDownstream := false
 	needModelReplace := originalModel != mappedModel
 	var mappedModelBytes []byte
@@ -698,6 +709,10 @@ readLoop:
 				}
 				break
 			}
+			if checkpoints.canContinue(ctx, wroteDownstream, usage) && !errors.Is(readErr, context.DeadlineExceeded) && !errors.Is(readErr, context.Canceled) {
+				bridgeTerminalEmitted = true // The wrapper continues without emitting a failed response.
+				return nil, checkpoints.continuation("peer_closed", readErr)
+			}
 			if !wroteDownstream {
 				return nil, wrapOpenAIWSFallback(classifyOpenAIWSReadFallbackReason(readErr), readErr)
 			}
@@ -713,6 +728,7 @@ readLoop:
 			continue
 		}
 		responseModelObserver.ObserveOpenAI(message, eventType)
+		checkpoints.observe(message, eventType)
 		eventCount++
 		if sequence := gjson.GetBytes(message, "sequence_number"); sequence.Exists() {
 			lastSequenceNumber = max(lastSequenceNumber, int(sequence.Int()))
@@ -776,6 +792,13 @@ readLoop:
 		}
 		imageCounter.AddSSEData(message)
 
+		if eventType == "response.failed" && gjson.GetBytes(message, "response.error.code").String() == "server_error" &&
+			!clientDisconnected && checkpoints.canContinue(ctx, wroteDownstream, usage) {
+			lease.MarkBroken()
+			bridgeTerminalEmitted = true
+			return nil, checkpoints.continuation("server_error", errors.New("upstream server_error"))
+		}
+
 		if eventType == "error" || eventType == "response.failed" {
 			markOpenAICyberPolicyEvent(c, message, http.StatusOK, usage)
 		}
@@ -831,10 +854,14 @@ readLoop:
 			lease.MarkBroken()
 			// The private HTTP bridge must expose a semantic upstream rejection,
 			// rather than relabel it as a transport interruption or replay it.
+			if errCodeRaw == "server_error" && checkpoints.canContinue(ctx, wroteDownstream, usage) && !clientDisconnected {
+				bridgeTerminalEmitted = true
+				return nil, checkpoints.continuation("server_error", errors.New("upstream server_error"))
+			}
 			if !wroteDownstream && canFallback && !(astraHTTPBridge && fallbackReason == "upstream_error_event") {
 				return nil, wrapOpenAIWSFallback(fallbackReason, errors.New(errMsg))
 			}
-			statusCode := openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
+			statusCode := openAIWSErrorHTTPStatus(message)
 			setOpsUpstreamError(c, statusCode, errMsg, "")
 			if astraHTTPBridge && !clientDisconnected && !c.Writer.Written() {
 				// No SSE bytes have been committed: preserve the upstream rejection
@@ -903,12 +930,22 @@ readLoop:
 				emitStreamMessage(message, isTerminalEvent)
 			}
 		} else {
+			// A lean WS terminal may omit output[] already delivered through
+			// output_item.done. Retain completed items in this request only so
+			// the non-streaming client receives the same answer as an SSE client.
+			if eventType == "response.output_item.done" && !clientDisconnected {
+				if err := nonstreamDoneItems.Observe(message); err != nil {
+					lease.MarkBroken()
+					return nil, err
+				}
+			}
 			if responseField.Exists() && responseField.Type == gjson.JSON {
 				finalResponse = []byte(responseField.Raw)
 			}
 		}
 
 		if isTerminalEvent {
+			canRestoreNonstreamOutput = eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete"
 			bridgeTerminalEmitted = true
 			if !clientDisconnected {
 				markOpenAIWSClientVisibleFailure(c, eventType, message)
@@ -945,6 +982,15 @@ readLoop:
 			return nil, errors.New("ws finished without final response")
 		}
 
+		output := gjson.GetBytes(finalResponse, "output")
+		if canRestoreNonstreamOutput && (!output.Exists() || output.Type == gjson.Null || (output.IsArray() && len(output.Array()) == 0)) {
+			if items, restored := nonstreamDoneItems.BuildOutput(); restored {
+				if patched, patchErr := sjson.SetRawBytes(finalResponse, "output", items); patchErr == nil {
+					finalResponse = patched
+					logOpenAIWSModeInfo("nonstream_output_restored account_id=%d items=%d", account.ID, len(gjson.ParseBytes(items).Array()))
+				}
+			}
+		}
 		if needModelReplace {
 			finalResponse = s.replaceModelInResponseBody(finalResponse, mappedModel, originalModel)
 		}

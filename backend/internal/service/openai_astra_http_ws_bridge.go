@@ -15,7 +15,8 @@ import (
 const openAIAstraHTTPBridgeContextKey = "openai_astra_http_ws_bridge"
 
 type openAIAstraHTTPBridgeRequest struct {
-	executionScope string
+	executionScope      string
+	outputBudgetPresent bool
 }
 
 // ctx_pool bridges full-input Responses for every model and downstream key.
@@ -116,7 +117,9 @@ func prepareOpenAIAstraHTTPBridge(c *gin.Context, account *Account, body []byte,
 	// Every experiment is a fresh, full-input turn. Include both downstream and
 	// upstream identity even for clients that supply no reliable thread/session.
 	scope, _ := deriveOpenAISessionHashes(fmt.Sprintf("astra_http_ws:%d:%d:%s:%s", getAPIKeyIDFromContext(c), account.ID, rawScope, uuid.NewString()))
-	c.Set(openAIAstraHTTPBridgeContextKey, openAIAstraHTTPBridgeRequest{executionScope: scope})
+	c.Set(openAIAstraHTTPBridgeContextKey, openAIAstraHTTPBridgeRequest{executionScope: scope,
+		outputBudgetPresent: gjson.GetBytes(body, "max_output_tokens").Exists() ||
+			gjson.GetBytes(body, "max_tokens").Exists() || gjson.GetBytes(body, "max_completion_tokens").Exists()})
 	return scope, nil
 }
 

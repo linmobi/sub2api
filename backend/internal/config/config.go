@@ -1260,6 +1260,9 @@ type GatewayOpenAIWSConfig struct {
 	// CtxPoolHTTPBridgeEnabled automatically bridges full-input HTTP Responses
 	// for OAuth accounts in ctx_pool mode, independently of the legacy canary.
 	CtxPoolHTTPBridgeEnabled bool `mapstructure:"ctx_pool_http_bridge_enabled"`
+	// Checkpoint continuation is experimental and disabled until validated for
+	// the upstream account. It never resumes after client-visible model output.
+	CtxPoolCheckpointRecoveryEnabled bool `mapstructure:"ctx_pool_checkpoint_recovery_enabled"`
 	// AstraHTTPBridgeEnabled is an experimental, default-off Responses HTTP/SSE
 	// to WSv2 bridge. It also requires an explicit OAuth account opt-in.
 	AstraHTTPBridgeEnabled bool `mapstructure:"astra_http_bridge_enabled"`
@@ -2450,6 +2453,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_ws.enabled", true)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_enabled", false)
 	viper.SetDefault("gateway.openai_ws.ctx_pool_http_bridge_enabled", true)
+	viper.SetDefault("gateway.openai_ws.ctx_pool_checkpoint_recovery_enabled", false)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_api_key_ids", []int64{})
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_read_timeout_seconds", 3600)
 	viper.SetDefault("gateway.openai_ws.astra_http_bridge_heartbeat_seconds", 15)
