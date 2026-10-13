@@ -267,7 +267,7 @@ func buildOpenAIAstraHTTPProtocolFailure(state *openAIAstraNativeHTTPState, resp
 
 func (s *OpenAIGatewayService) writeOpenAIAstraNativeHTTPFailure(c *gin.Context, resp *http.Response, model string) {
 	state := openAIAstraNativeHTTPStateFromContext(c)
-	if state == nil || !(state.accepted || state.upstreamSuccessStatus) || state.failureDelivered || IsResponseCommitted(c) {
+	if state == nil || (!state.accepted && !state.upstreamSuccessStatus) || state.failureDelivered || IsResponseCommitted(c) {
 		return
 	}
 	if c.Request != nil && c.Request.Context().Err() != nil {

@@ -911,9 +911,10 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			status = http.StatusBadGateway
 		}
 		readKind := "none"
-		if kind == "stream_read" {
+		switch kind {
+		case "stream_read":
 			readKind = openAIWSHTTPBridgeReadErrorKind(cause)
-		} else if kind == "missing_terminal" {
+		case "missing_terminal":
 			readKind = "eof"
 		}
 		logOpenAIWSHTTPBridgeFailure(openAIWSHTTPBridgeFailureMetadata{accountID: account.ID, turn: turn, status: status, upstreamSuccessStatus: astraSuccessStatus,

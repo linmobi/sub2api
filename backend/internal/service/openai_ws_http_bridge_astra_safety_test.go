@@ -20,7 +20,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func runAstraWSHTTPBridgeFixture(t *testing.T, ctx context.Context, response *http.Response, payload []byte, write func([]byte) error, configure ...func(*Account)) (*OpenAIForwardResult, error, *httpUpstreamRecorder, [][]byte) {
+func runAstraWSHTTPBridgeFixture(t *testing.T, ctx context.Context, response *http.Response, payload []byte, write func([]byte) error, configure ...func(*Account)) (*OpenAIForwardResult, *httpUpstreamRecorder, [][]byte, error) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	upstream := &httpUpstreamRecorder{resp: response}
@@ -42,7 +42,7 @@ func runAstraWSHTTPBridgeFixture(t *testing.T, ctx context.Context, response *ht
 			writes = append(writes, append([]byte(nil), message...))
 			return nil
 		})
-	return result, err, upstream, writes
+	return result, upstream, writes, err
 }
 
 func astraWSHTTPFixtureResponse(sse string, readError error) *http.Response {
@@ -90,7 +90,7 @@ func TestAstraWSHTTPBridgeAcceptedProgressNeverFailsOver(t *testing.T) {
 	for _, tt := range progress {
 		for _, readError := range []error{nil, io.ErrUnexpectedEOF} {
 			t.Run(fmt.Sprintf("%s/read_error_%v", tt.name, readError != nil), func(t *testing.T) {
-				result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(),
+				result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(),
 					astraWSHTTPFixtureResponse("data: "+tt.event+"\n\n", readError), astraWSHTTPFixturePayload(), nil)
 				require.Error(t, err)
 				var failover *UpstreamFailoverError
@@ -119,7 +119,7 @@ func TestAstraWSHTTPBridgeFailureUsageEvidence(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			sse := `data: {"type":"response.in_progress","sequence_number":6,"response":{"id":"resp_usage","usage":` + tt.usage + `}}` + "\n\n"
-			result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
+			result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
 			require.Error(t, err)
 			var failover *UpstreamFailoverError
 			require.False(t, errors.As(err, &failover))
@@ -145,7 +145,7 @@ func TestAstraWSHTTPBridgeAcceptedSemanticFailure(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			sse := "data: " + `{"type":"response.created","sequence_number":8,"response":{"id":"resp_semantic"}}` + "\n\ndata: " + tt.event + "\n\n"
-			result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
+			result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
 			require.Error(t, err, "response.failed is not a successful zero-usage generation")
 			var failover *UpstreamFailoverError
 			require.False(t, errors.As(err, &failover))
@@ -161,7 +161,7 @@ func TestAstraWSHTTPBridgeAcceptedSemanticFailure(t *testing.T) {
 }
 
 func TestAstraWSHTTPBridgePreacceptanceHTTP503CanFailOver(t *testing.T) {
-	result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), &http.Response{
+	result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), &http.Response{
 		StatusCode: http.StatusServiceUnavailable, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"code":"server_is_overloaded","message":"Synthetic unavailable"}}`)),
 	}, astraWSHTTPFixturePayload(), nil)
 	var failover *UpstreamFailoverError
@@ -183,7 +183,7 @@ func TestAstraWSHTTPBridgeSuccessStatusWithoutFrameNeverReplays(t *testing.T) {
 		{"uncommitted_first_frame_read_error", `data: {"type":"response.created","response":{"id":"resp_partial"}}` + "\n", io.ErrUnexpectedEOF},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(tt.sse, tt.readError), astraWSHTTPFixturePayload(), nil)
+			result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(tt.sse, tt.readError), astraWSHTTPFixturePayload(), nil)
 			require.Error(t, err)
 			var failover *UpstreamFailoverError
 			require.False(t, errors.As(err, &failover), "HTTP200 with missing protocol evidence cannot safely prove generation did not start")
@@ -204,7 +204,7 @@ func TestAstraWSHTTPBridgeSSEWholeFrameValidation(t *testing.T) {
 		{"multiple_data_documents", "data: " + created + "\ndata: " + tool + "\n\ndata: " + completed + "\n\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err, _, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(tt.sse, nil), astraWSHTTPFixturePayload(), nil)
+			result, _, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(tt.sse, nil), astraWSHTTPFixturePayload(), nil)
 			require.NoError(t, err)
 			require.NotNil(t, result)
 			require.Len(t, writes, 3)
@@ -217,7 +217,7 @@ func TestAstraWSHTTPBridgeSSEWholeFrameValidation(t *testing.T) {
 	for _, tail := range []string{`{"type":"response.completed"`, `{"type":"response.completed"}garbage`, strings.Repeat(tool, maxOpenAIConcatenatedJSONDocuments)} {
 		t.Run(fmt.Sprintf("malformed_or_over_limit_%d", len(tail)), func(t *testing.T) {
 			sse := "data: " + created + "\n\ndata: " + tool + tail + "\n\n"
-			result, err, _, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
+			result, _, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
 			require.Error(t, err)
 			require.Nil(t, result)
 			for _, message := range writes {
@@ -233,7 +233,7 @@ func TestAstraWSHTTPBridgePreservesHistoryToolsModelEffortTier(t *testing.T) {
 		t.Run(effort, func(t *testing.T) {
 			payload := []byte(`{"type":"response.create","model":"gpt-6-astra","store":false,"reasoning":{"effort":"` + effort + `","mode":"thinking"},"service_tier":"default","instructions":"Synthetic","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"shell","format":{"type":"text"}}]}],"input":[{"role":"user","content":"Synthetic history"},{"type":"custom_tool_call","call_id":"call_keep","name":"functions.shell","input":"keep exact argument"},{"type":"custom_tool_call_output","call_id":"call_keep","output":"keep exact output"},{"role":"user","content":"Synthetic followup"}]}`)
 			completed := `data: {"type":"response.completed","sequence_number":0,"response":{"id":"resp_preserve","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n"
-			result, err, upstream, _ := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(completed, nil), payload, nil)
+			result, upstream, _, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(completed, nil), payload, nil)
 			require.NoError(t, err)
 			require.NotNil(t, result)
 			require.Len(t, upstream.bodies, 1)
@@ -250,7 +250,7 @@ func TestAstraWSHTTPBridgePreservesHistoryToolsModelEffortTier(t *testing.T) {
 func TestAstraWSHTTPBridgeCanceledClientSkipsSyntheticFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sse := "data: " + `{"type":"response.output_text.delta","sequence_number":0,"delta":"synthetic visible"}` + "\n\n"
-	result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, ctx, astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), func([]byte) error { cancel(); return context.Canceled })
+	result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, ctx, astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), func([]byte) error { cancel(); return context.Canceled })
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, result)
 	require.Len(t, upstream.requests, 1)
@@ -275,7 +275,8 @@ func TestAstraNativeHTTP_SuccessWithoutProtocolEvidenceDoesNotReplay(t *testing.
 					svc.cfg.Gateway.OpenAIWS.CtxPoolHTTPBridgeEnabled = false
 					svc.cfg.Gateway.OpenAIWS.AstraHTTPBridgeEnabled = false
 					account.Credentials["model_mapping"] = map[string]any{"astra-alias": "gpt-6-astra"}
-					upstream := svc.httpUpstream.(*httpUpstreamRecorder)
+					upstream, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+					require.True(t, ok)
 					upstream.resp = astraWSHTTPFixtureResponse(tt.sse, tt.readError)
 					result, err := svc.Forward(context.Background(), c, account, []byte(fmt.Sprintf(`{"model":%q,"stream":%v,"input":"Synthetic finite request"}`, model, stream)))
 					require.Error(t, err)
@@ -309,7 +310,7 @@ func TestAstraWSHTTPBridgeLegalIncompleteIsTerminal(t *testing.T) {
 	sse := "data: " + `{"type":"response.created","sequence_number":0,"response":{"id":"resp_incomplete"}}` + "\n\n" +
 		"data: " + `{"type":"error","sequence_number":1,"code":"server_error","message":"Synthetic recoverable warning"}` + "\n\n" +
 		"data: " + `{"type":"response.incomplete","sequence_number":2,"response":{"id":"resp_incomplete","status":"incomplete","output":[],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"output_tokens":2}}}` + "\n\n"
-	result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
+	result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Len(t, upstream.requests, 1)
@@ -352,7 +353,7 @@ func TestAstraWSHTTPBridgeTypedMetadataContainsNoPayload(t *testing.T) {
 			if tt.cancel {
 				write = func([]byte) error { cancel(); return context.Canceled }
 			}
-			result, err, _, _ := runAstraWSHTTPBridgeFixture(t, ctx, astraWSHTTPFixtureResponse(tt.events, tt.readError), astraWSHTTPFixturePayload(), write)
+			result, _, _, err := runAstraWSHTTPBridgeFixture(t, ctx, astraWSHTTPFixtureResponse(tt.events, tt.readError), astraWSHTTPFixturePayload(), write)
 			require.Error(t, err)
 			require.Nil(t, result)
 			sink.mu.Lock()
@@ -402,7 +403,7 @@ func TestAstraWSHTTPBridgeCheckedFailureSequence(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			sse := `data: {"type":"response.custom_tool_call_input.delta","sequence_number":` + tt.sequence + `,"delta":"Synthetic tool argument"}` + "\n\n"
-			result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
+			result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(sse, nil), astraWSHTTPFixturePayload(), nil)
 			require.Error(t, err)
 			require.Nil(t, result)
 			require.Len(t, upstream.requests, 1)
@@ -438,7 +439,8 @@ func TestAstraNativeHTTP_CheckedFailureSequence(t *testing.T) {
 			svc, account, c, rec, dialer := astraHTTPBridgeFixture(t, &openAIWSCaptureConn{})
 			svc.cfg.Gateway.OpenAIWS.CtxPoolHTTPBridgeEnabled = false
 			svc.cfg.Gateway.OpenAIWS.AstraHTTPBridgeEnabled = false
-			upstream := svc.httpUpstream.(*httpUpstreamRecorder)
+			upstream, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+			require.True(t, ok)
 			upstream.resp = astraWSHTTPFixtureResponse(`data: {"type":"response.custom_tool_call_input.delta","sequence_number":`+tt.sequence+`,"delta":"Synthetic tool argument"}`+"\n\n", nil)
 			result, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-6-astra","stream":true,"input":"Synthetic finite request"}`))
 			require.Error(t, err)
@@ -536,7 +538,8 @@ func TestAstraNativeHTTP_HeaderDeadlineWithSuccessNeverReplays(t *testing.T) {
 			require.Equal(t, "first_output_timeout", gjson.Get(rec.Body.String(), "error.code").String())
 			raw, found := c.Get(OpsUpstreamErrorsKey)
 			require.True(t, found)
-			events := raw.([]*OpsUpstreamErrorEvent)
+			events, ok := raw.([]*OpsUpstreamErrorEvent)
+			require.True(t, ok)
 			require.Len(t, events, 1)
 			require.Equal(t, "first_output_timeout", events[0].Kind)
 			require.Equal(t, http.StatusGatewayTimeout, events[0].UpstreamStatusCode)
@@ -549,7 +552,7 @@ func TestAstraNativeHTTP_HeaderDeadlineWithSuccessNeverReplays(t *testing.T) {
 func TestAstraWSHTTPBridgeGuardUsesFinalNormalizedModel(t *testing.T) {
 	for _, body := range []string{"", `data: {"type":"response.created","response":{"id":"resp_partial"`} {
 		t.Run(fmt.Sprintf("body_bytes_%d", len(body)), func(t *testing.T) {
-			result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(body, nil), astraWSHTTPFixturePayload(), nil,
+			result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(body, nil), astraWSHTTPFixturePayload(), nil,
 				func(account *Account) {
 					account.Credentials = map[string]any{"model_mapping": map[string]any{"astra-alias": "gpt-6-astra", "gpt-6-astra": "gpt-6-sol"}}
 				})
@@ -577,7 +580,7 @@ func TestAstraHTTPProtocolExtensionCountersDoNotChangeResponseSequence(t *testin
 			require.Equal(t, int64(9), gjson.GetBytes(failure, "sequence_number").Int())
 		})
 	}
-	result, err, upstream, writes := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(
+	result, upstream, writes, err := runAstraWSHTTPBridgeFixture(t, context.Background(), astraWSHTTPFixtureResponse(
 		`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_extension"}}`+"\n\n"+
 			`data: {"type":"telemetry.extension","sequence_number":"extension-a"}`+"\n\n"+
 			`data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_extension","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`+"\n\n", nil), astraWSHTTPFixturePayload(), nil)
