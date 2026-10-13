@@ -29,7 +29,9 @@ func TestCtxPoolHTTPBridge_ExplicitStatusWithoutReplay(t *testing.T) {
 				require.Equal(t, "server_error", gjson.Get(rec.Body.String(), "error.type").String())
 				require.NotContains(t, rec.Body.String(), "upstream_stream_interrupted")
 				require.Equal(t, 1, dialer.DialCount())
-				require.Nil(t, svc.httpUpstream.(*httpUpstreamRecorder).lastReq)
+				httpClient, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+				require.True(t, ok)
+				require.Nil(t, httpClient.lastReq)
 			})
 		}
 	}
